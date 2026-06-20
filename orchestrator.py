@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import asyncio
 import signal
+import time
 import sys
 from typing import Optional
 
@@ -44,6 +45,7 @@ from analysis.mev_detector import MevDetector
 from analysis.order_flow import OrderFlowAnalyzer
 from analysis.sentiment import SentimentAnalyzer
 from analysis.social_graph import SocialGraphAnalyzer
+from analysis.soft_rug import SoftRugDetector
 from utils.analytics_pipeline import AnalyticsPipeline
 from utils.anti_sandwich import AntiSandwich
 from utils.attribution import AutoTuner
@@ -124,6 +126,9 @@ class Orchestrator:
         # our own signal components actually predict profitable trades).
         self.autotuner = AutoTuner(self.alpha_signal)
 
+        # Soft-rug early-warning model (exits before a gradual dump completes).
+        self.soft_rug = SoftRugDetector()
+
         self._tasks: list[asyncio.Task] = []
         self._stop_event = asyncio.Event()
         self.state = "INIT"
@@ -169,6 +174,7 @@ class Orchestrator:
                 gas_optimizer=self.gas_optimizer,
                 anti_sandwich=self.anti_sandwich,
                 alpha_signal=self.alpha_signal,
+                soft_rug=self.soft_rug,
             )
 
         # Register migration detector callback -> notify + extend hold time
@@ -231,6 +237,10 @@ class Orchestrator:
         await self.analytics_pipeline.start()
         # Start the weekly weight re-tuner (closed-loop learning).
         await self.autotuner.start()
+        # Start the nightly soft-rug model retrain.
+        await self.soft_rug.start_nightly_retrain()
+        # Start the soft-rug position monitor (exits high-risk positions early).
+        self._tasks.append(asyncio.create_task(self._soft_rug_monitor()))
 
         self.state = "RUNNING"
         log.info("orchestrator.running",
@@ -387,6 +397,75 @@ class Orchestrator:
                 log.error("orchestrator.gas_poll_error", error=str(e))
             await asyncio.sleep(30)
 
+    async def _soft_rug_monitor(self) -> None:
+        """
+        Periodically score open positions for soft-rug risk. If the model
+        flags a position as high-risk, emit an urgent SELL to exit before the
+        gradual dump completes.
+        """
+        from analysis.soft_rug import RugFeatures
+        from utils.data_providers import get_providers
+        interval = self.cfg.get_nested("analysis", "soft_rug", default={}).get(
+            "check_interval_sec", 30)
+        while not self._stop_event.is_set():
+            try:
+                if self.risk.positions:
+                    providers = get_providers()
+                    for key, pos in list(self.risk.positions.items()):
+                        if pos.chain != "solana":
+                            continue
+                        try:
+                            helius = providers["helius"]
+                            dex = providers["dexscreener"]
+                            holders = await helius.get_token_holders(pos.token)
+                            holder_list = holders if isinstance(holders, list) else []
+                            top3_pct = 0.0
+                            if holder_list:
+                                # holder entries carry an 'amount' or 'uiAmount'
+                                amounts = []
+                                for h in holder_list[:20]:
+                                    a = h.get("amount") or h.get("uiAmount") or 0
+                                    try: amounts.append(float(a))
+                                    except (TypeError, ValueError): pass
+                                total = sum(amounts)
+                                top3_pct = (sum(sorted(amounts, reverse=True)[:3]) / total * 100) if total > 0 else 0
+                            liq_usd = await dex.get_liquidity_usd(pos.token) or 0.0
+                            bc_state = await self.bonding.fetch_state(pos.token)
+                            # Order-flow snapshot for sell velocity / b/s ratio
+                            of = self.order_flow.snapshot(pos.token, 30)
+                            age_sec = max(1.0, time.time() - pos.opened_at)
+                            features = RugFeatures(
+                                initial_holder_count=len(holder_list),
+                                top3_concentration_pct=top3_pct,
+                                sell_velocity_30s=(of.sell_count * (60.0/30.0)) if of else 0.0,
+                                buy_sell_ratio_30s=(of.buy_count / max(1, of.sell_count)) if of else 1.0,
+                                liquidity_usd=liq_usd,
+                                bonding_curve_completion_pct=(bc_state.completion_pct if bc_state else 0.0),
+                                age_seconds=age_sec,
+                            )
+                            pred = self.soft_rug.predict_proba(features)
+                            if pred.is_high_risk:
+                                log.warning("orchestrator.soft_rug_exit",
+                                            token=pos.token, p=pred.rug_probability,
+                                            factors=pred.top_risk_factors)
+                                await self.notifier.notify_error(
+                                    f"🚨 SOFT-RUG EXIT\nToken: {pos.token}\n"
+                                    f"P(rug)={pred.rug_probability:.0%}\n"
+                                    f"Factors: {', '.join(pred.top_risk_factors)}"
+                                )
+                                await self.signal_queue.put(Signal(
+                                    strategy="soft_rug", chain=pos.chain, token_address=pos.token,
+                                    signal_type=SignalType.SELL, suggested_size_pct=1.0,
+                                    confidence=pred.rug_probability,
+                                    reason=f"SOFT-RUG EXIT (P={pred.rug_probability:.0%})",
+                                ))
+                        except Exception as e:
+                            log.debug("orchestrator.soft_rug_check_error",
+                                      token=pos.token, error=str(e))
+            except Exception as e:
+                log.error("orchestrator.soft_rug_monitor_error", error=str(e))
+            await asyncio.sleep(interval)
+
     # ------------------------------------------------------------------
     async def _shutdown(self) -> None:
         log.info("orchestrator.shutdown_starting")
@@ -395,6 +474,7 @@ class Orchestrator:
             self._dashboard_task.cancel()
         await self.analytics_pipeline.stop()
         await self.autotuner.stop()
+        await self.soft_rug.stop()
         await self.dev_tracker.stop_all()
         for t in self._tasks:
             t.cancel()

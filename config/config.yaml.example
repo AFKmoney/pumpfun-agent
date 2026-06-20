@@ -251,6 +251,24 @@ analysis:
   sentiment_poll_interval_sec: 120          # how often to poll Twitter/Telegram
   sentiment:
     telegram_chat_ids: []                   # list of chat IDs to monitor, e.g. ["-1001234567890"]
+
+  # Soft-rug early-warning model (gradient-boosted decision stumps).
+  # Exits positions flagged as high P(rug) before a gradual dump completes.
+  # Retrains nightly at 03:00 UTC from the trade_features table.
+  soft_rug:
+    enabled: true
+    model_path: "./data/soft_rug_model.json"
+    threshold: 0.65              # P(rug) at which we trigger a preventive exit
+    check_interval_sec: 30       # how often to re-score open positions
+    n_estimators: 50             # number of boosting stumps
+    learning_rate: 0.1
+    min_samples: 100             # min closed trades before trusting the model
+                                 # (below this, a domain-knowledge heuristic is used)
+
+  # AlphaSignal weight auto-tuning (weekly logistic regression).
+  autotuner:
+    min_samples: 50              # min closed trades before re-tuning
+    l2_strength: 5.0             # regularization toward the hand-tuned priors
 # Required env vars for sentiment (optional, but without them sentiment=0):
 #   TWITTER_BEARER_TOKEN     (Twitter API v2)
 #   TELEGRAM_BOT_TOKEN       (already used for notifications)

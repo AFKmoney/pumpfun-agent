@@ -48,6 +48,7 @@ class Executor:
         gas_optimizer: GasOptimizer,
         anti_sandwich: AntiSandwich,
         alpha_signal=None,
+        soft_rug=None,
     ) -> None:
         self.adapter = adapter
         self.risk = risk_manager
@@ -59,6 +60,7 @@ class Executor:
         self.gas_opt = gas_optimizer
         self.anti_sandwich = anti_sandwich
         self.alpha_signal = alpha_signal
+        self.soft_rug = soft_rug
         self.bonding = BondingCurveAnalyzer()
         self.cfg = Config.get()
         self.paper_mode = self.cfg["trading"]["mode"] == "paper"
