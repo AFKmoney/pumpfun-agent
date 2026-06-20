@@ -83,6 +83,7 @@ class Executor:
 
     # ------------------------------------------------------------------
     async def _handle_buy(self, signal: Signal, size_base: float) -> None:
+        meta = signal.metadata or {}
         # 1. Anti-rugpull gate (sniping skips the slow honeypot micro-buy)
         skip_honeypot = (signal.strategy == "sniping")
         verdict = await self.anti_rug.check(signal.token_address, skip_honeypot=skip_honeypot)
@@ -95,11 +96,12 @@ class Executor:
         key = f"{signal.chain}:{signal.token_address}"
         if key not in self.risk.positions:
             try:
-                score = await self.scorer.score(signal.token_address, token_meta={
-                    "symbol": signal.reason.split(":")[-1].split("(")[0].strip() if ":" in signal.reason else "",
-                    "name": "",
-                    "uri": "",
-                })
+                token_meta = {
+                    "symbol": meta.get("token_symbol") or "",
+                    "name": meta.get("token_name") or "",
+                    "uri": meta.get("uri") or "",
+                }
+                score = await self.scorer.score(signal.token_address, token_meta=token_meta)
                 log.info("executor.token_score", token=signal.token_address,
                          score=score.score, recommendation=score.recommendation,
                          confidence=score.confidence)
@@ -187,10 +189,9 @@ class Executor:
                 pnl = await self.risk.close_position(signal.chain, signal.token_address, price, reason)
                 self._unregister_position_tracking(signal.chain, signal.token_address)
             else:
-                # Partial sell: just log (full partial-sell impl would adjust position)
-                log.info("executor.paper_partial_sell", token=signal.token_address,
-                         pct=size_pct, reason=reason)
-                pnl = (price - key_pos.entry_price) / key_pos.entry_price * 100
+                pnl = await self.risk.reduce_position(
+                    signal.chain, signal.token_address, size_pct, price, reason,
+                )
             if pnl is not None:
                 await self.notifier.notify_trade_closed(signal.chain, signal.token_address, pnl, reason)
             return
@@ -204,10 +205,13 @@ class Executor:
                 )
                 self._unregister_position_tracking(signal.chain, signal.token_address)
             else:
-                # Partial sell: log only (full impl would reduce position size in DB)
-                log.info("executor.partial_sell_executed", token=signal.token_address,
-                         pct=size_pct, reason=reason)
-                pnl = None
+                # Partial sell: reduce the position in the bookkeeping (was a no-op before)
+                pnl = await self.risk.reduce_position(
+                    signal.chain, signal.token_address, size_pct,
+                    result.executed_price or key_pos.entry_price, reason,
+                )
+                log.info("executor.partial_sell_bookkept", token=signal.token_address,
+                         pct=size_pct, remaining_base=round(key_pos.size_base, 4))
             if pnl is not None:
                 await self.notifier.notify_trade_closed(signal.chain, signal.token_address, pnl, reason)
         else:
@@ -219,13 +223,24 @@ class Executor:
     # ------------------------------------------------------------------
     def _register_position_tracking(self, signal: Signal, size_base: float, entry_price: float) -> None:
         """Register the new position with SmartExitManager + DevTracker."""
-        from risk.types import Position
         key = f"{signal.chain}:{signal.token_address}"
         pos = self.risk.positions.get(key)
         if pos:
             self.smart_exits.init_position(pos)
-        # DevTracker: would need the dev wallet address from the create event.
-        # For now we skip (dev tracker needs the dev wallet from parser).
+        # DevTracker: now armed. The dev wallet comes from the signal metadata
+        # (populated by SnipingStrategy from the create event). Without it we
+        # cannot track — log and skip gracefully.
+        meta = signal.metadata or {}
+        dev_wallet = meta.get("dev_wallet")
+        if dev_wallet and signal.chain == "solana":
+            try:
+                # Initial balance unknown; the tracker will establish it on first ws tick.
+                self.dev_tracker.track(signal.chain, signal.token_address, dev_wallet, initial_balance=0.0)
+                log.info("executor.dev_tracker_armed",
+                         token=signal.token_address, dev_wallet=dev_wallet[:8])
+            except Exception as e:
+                log.warning("executor.dev_tracker_arm_failed",
+                            token=signal.token_address, error=str(e))
         log.info("executor.position_tracking_registered", token=signal.token_address)
 
     def _unregister_position_tracking(self, chain: str, token: str) -> None:

@@ -33,6 +33,13 @@ class Signal:
     target_price: Optional[float] = None
     stop_loss_pct: Optional[float] = None
     take_profit_pct: Optional[float] = None
+    # Free-form metadata bag. Strategies populate this with context the executor
+    # needs but that doesn't fit the fixed fields above:
+    #   - "dev_wallet": str  (the token creator's wallet, for DevTracker)
+    #   - "token_symbol": str, "token_name": str, "uri": str (for TokenScorer)
+    #   - "bonding_curve": str (PDA, for fast direct execution)
+    #   - "source_score": dict (per-analyzer scores at signal time, for attribution)
+    metadata: Optional[dict] = None
 
 
 class BaseStrategy(ABC):

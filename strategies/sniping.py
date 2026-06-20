@@ -4,12 +4,15 @@ sniping.py
 Sniper strategy: detect new pump.fun token launches and buy within milliseconds.
 
 Flow:
-1. Subscribe to pump.fun program logs via Helius WebSocket.
-2. On "Create" log, fetch the tx and decode the create instruction.
-3. Run anti-rugpull pre-flight checks.
-4. Fire BUY signal with sizing from risk manager.
+1. Subscribe to pump.fun program logs via the adapter's `watch_new_tokens()`.
+2. The adapter now emits events that may already carry the parsed mint /
+   bonding_curve / user (low-latency path, no getTransaction round-trip).
+3. If the event lacks the parsed mint, fall back to fetching the tx.
+4. Run anti-rugpull pre-flight checks.
+5. Fire BUY signal carrying the dev wallet (in metadata) so the executor can
+   arm the DevTracker on the resulting position.
 
-Latency target: <1500ms from launch detection to buy tx submission.
+Latency target: <500ms from launch detection to buy tx submission.
 """
 from __future__ import annotations
 
@@ -59,18 +62,30 @@ class SnipingStrategy(BaseStrategy):
         if not signature:
             return None
 
-        # 1. Fetch & decode the pump.fun create instruction
-        try:
-            create_event = await fetch_create_event_from_signature(self.adapter, signature)
-        except Exception as e:
-            log.warning("sniping.fetch_create_failed", sig=signature, error=str(e))
-            return None
-        if not create_event:
-            return None
+        mint = event.get("mint")
+        bonding_curve = event.get("bonding_curve")
+        dev_wallet = event.get("user")
+        symbol = ""
+        name = ""
 
-        mint = create_event.mint
+        # 1. If the adapter could not parse the mint from logs, fetch the tx
+        if not mint:
+            try:
+                create_event = await fetch_create_event_from_signature(self.adapter, signature)
+            except Exception as e:
+                log.warning("sniping.fetch_create_failed", sig=signature, error=str(e))
+                return None
+            if not create_event:
+                return None
+            mint = create_event.mint
+            bonding_curve = bonding_curve or create_event.bonding_curve
+            dev_wallet = dev_wallet or create_event.user
+            symbol = create_event.symbol
+            name = create_event.name
+
         log.info("sniping.new_launch_detected",
-                 mint=mint, symbol=create_event.symbol, name=create_event.name[:40])
+                 mint=mint, symbol=symbol or "?", name=(name or "?")[:40],
+                 source=event.get("source", "fetch"))
 
         # 2. Anti-rugpull gate
         if self.anti_rug is not None:
@@ -81,10 +96,9 @@ class SnipingStrategy(BaseStrategy):
                     return None
             except Exception as e:
                 log.warning("sniping.anti_rug_check_failed", mint=mint, error=str(e))
-                # Fail-soft: skip this token
                 return None
 
-        # 3. Emit BUY signal
+        # 3. Emit BUY signal carrying the dev wallet for the executor's DevTracker
         return Signal(
             strategy=self.name,
             chain=chain,
@@ -92,7 +106,13 @@ class SnipingStrategy(BaseStrategy):
             signal_type=SignalType.BUY,
             suggested_size_pct=0.02,   # 2% of allocated capital
             confidence=0.65,
-            reason=f"New pump.fun launch: {create_event.symbol} ({create_event.name[:30]})",
+            reason=f"New pump.fun launch: {symbol or '?'} ({(name or '?')[:30]})",
             stop_loss_pct=15.0,
             take_profit_pct=80.0,
+            metadata={
+                "dev_wallet": dev_wallet,
+                "bonding_curve": bonding_curve,
+                "token_symbol": symbol,
+                "token_name": name,
+            },
         )

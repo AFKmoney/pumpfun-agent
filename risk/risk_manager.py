@@ -199,7 +199,12 @@ class RiskManager:
             if not pos:
                 return None
             pnl_pct = (exit_price - pos.entry_price) / pos.entry_price * 100
-            self.daily_pnl_pct += pnl_pct * (pos.size_base / 100)
+            # Weight the per-token pnl by the position's share of allocated capital.
+            # `_allocated_capital_for_chain` returns the SOL/ETH budget for the
+            # position's chain. daily_pnl_pct stays a true % of capital.
+            cap = self._allocated_capital_for_chain(pos.chain)
+            weight = (pos.size_base / cap) if cap > 0 else 0.0
+            self.daily_pnl_pct += pnl_pct * weight
             rec = TradeRecord(
                 chain=chain, token=token, strategy=pos.strategy,
                 side="SELL", size_base=pos.size_base, price=exit_price,
@@ -217,6 +222,61 @@ class RiskManager:
                 log.error("risk_manager.persist_close_failed", error=str(e))
             log.info("risk_manager.position_closed", token=token, pnl_pct=round(pnl_pct, 2), reason=reason)
             return pnl_pct
+
+    async def reduce_position(
+        self, chain: str, token: str, fraction: float, exit_price: float, reason: str,
+    ) -> Optional[float]:
+        """
+        Partially close a position (e.g. TP ladder tranche). Reduces size_base
+        and size_token proportionally, records a SELL trade, updates daily PnL
+        for the realized portion, and persists the new reduced position.
+
+        Args:
+            fraction: 0..1 of the position to sell.
+        Returns: realized pnl_pct for the sold portion, or None if no position.
+        """
+        if fraction <= 0:
+            return None
+        if fraction >= 1.0:
+            return await self.close_position(chain, token, exit_price, reason)
+        async with self._lock:
+            key = f"{chain}:{token}"
+            pos = self.positions.get(key)
+            if not pos:
+                return None
+            pnl_pct = (exit_price - pos.entry_price) / pos.entry_price * 100
+            cap = self._allocated_capital_for_chain(pos.chain)
+            realized_size_base = pos.size_base * fraction
+            weight = (realized_size_base / cap) if cap > 0 else 0.0
+            self.daily_pnl_pct += pnl_pct * weight
+            # Shrink remaining position
+            pos.size_base *= (1.0 - fraction)
+            pos.size_token *= (1.0 - fraction)
+            rec = TradeRecord(
+                chain=chain, token=token, strategy=pos.strategy,
+                side="SELL", size_base=realized_size_base, price=exit_price,
+                ts=time.time(), pnl_pct=pnl_pct,
+            )
+            self.history.append(rec)
+            try:
+                self.db.upsert_position(pos)
+                self.db.insert_trade(rec)
+                self.db.upsert_daily_pnl(self._today_str(), self.daily_pnl_pct)
+            except Exception as e:
+                log.error("risk_manager.persist_reduce_failed", error=str(e))
+            log.info("risk_manager.position_reduced", token=token,
+                     fraction=round(fraction, 3), pnl_pct=round(pnl_pct, 2),
+                     remaining_base=round(pos.size_base, 4), reason=reason)
+            return pnl_pct
+
+    def _allocated_capital_for_chain(self, chain: str) -> float:
+        """Allocated capital (SOL or ETH) for a chain, from config. Fallback 1.0."""
+        try:
+            chains_cfg = self.cfg.get("chains", {})
+            key = "allocated_capital_sol" if chain == "solana" else "allocated_capital_eth"
+            return float(chains_cfg.get(chain, {}).get(key, 0.0)) or 1.0
+        except Exception:
+            return 1.0
 
     # ------------------------------------------------------------------
     async def check_exits(self, price_provider) -> None:

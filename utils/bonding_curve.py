@@ -46,6 +46,30 @@ REAL_SOL_RESERVES_AT_MIGRATION = 85.0  # SOL — pump.fun migrates around this t
 PUMP_FEE_BPS = 100                     # 1% protocol fee
 FEE_RECIPIENT_BPS = 50                 # 0.5% to fee recipient (if any)
 
+# Cache SOL/USD price (refreshed every 60s) to avoid hammering Jupiter Price API.
+_SOL_USD_CACHE: dict[str, float] = {"price": 0.0, "ts": 0.0}
+
+
+async def fetch_sol_usd() -> float:
+    """Fetch SOL/USD from Jupiter Price API V3. Cached for 60 seconds."""
+    now = time.time()
+    if _SOL_USD_CACHE["price"] > 0 and now - _SOL_USD_CACHE["ts"] < 60:
+        return _SOL_USD_CACHE["price"]
+    import aiohttp
+    url = "https://price.jup.ag/v6/price?ids=So11111111111111111111111111111111111111112"
+    try:
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=5)) as s:
+            async with s.get(url) as r:
+                data = await r.json()
+        price = float(data["data"]["So11111111111111111111111111111111111111112"]["price"])
+        _SOL_USD_CACHE["price"] = price
+        _SOL_USD_CACHE["ts"] = now
+        return price
+    except Exception as e:
+        log.warning("bonding_curve.sol_usd_fetch_failed", error=str(e))
+        # Fallback to last known price, else a conservative estimate
+        return _SOL_USD_CACHE["price"] if _SOL_USD_CACHE["price"] > 0 else 150.0
+
 
 @dataclass
 class BondingCurveState:
@@ -108,10 +132,9 @@ class BondingCurveAnalyzer:
             if real_sol_reserves is None:
                 return None
 
-            # USD price from DexScreener (if listed)
+            # USD price from DexScreener (if listed) + live SOL/USD from Jupiter
             price_usd = await dex.get_price_usd(mint) if complete else 0.0
-            # Solana price in USD ~ 200 (placeholder; in prod fetch from Jupiter SOL/USDC)
-            sol_usd = 200.0
+            sol_usd = await fetch_sol_usd()
             current_price_sol = (virtual_sol / virtual_token) if virtual_token > 0 else 0.0
             if price_usd == 0.0:
                 price_usd = current_price_sol * sol_usd
@@ -173,29 +196,48 @@ class BondingCurveAnalyzer:
             real_sol_reserves (u64)
             token_total_supply (u64)
             complete (bool, 1 byte)
+
+        Handles Helius getAccountInfo response shapes for encoding=base64:
+            {'value': {'data': ['<b64>', 'base64'], ...}}   <- LIST form (real)
+            {'value': {'data': [b64, 'base64+zstd'], ...}}  <- zstd-compressed
         """
         try:
-            # If encoded as jsonParsed, the data is in 'value.data.parsed'
-            data_field = account_info.get("data", {})
-            if isinstance(data_field, dict):
-                # Could be base64 or base64+zstd
-                encoding = data_field.get("encoding", "")
-                if encoding in ("base64", "base64+zstd"):
-                    import base64
-                    raw = base64.b64decode(data_field[0] if isinstance(data_field.get(0), str) else "")
-                    if len(raw) < 8 + 5 * 8 + 1:
+            import base64
+            data_field = account_info.get("data")
+            raw: Optional[bytes] = None
+            if isinstance(data_field, list) and len(data_field) >= 2:
+                b64_str, encoding = data_field[0], data_field[1]
+                if encoding == "base64":
+                    raw = base64.b64decode(b64_str)
+                elif encoding == "base64+zstd":
+                    try:
+                        import zstandard  # type: ignore
+                        raw = zstandard.decompress(base64.b64decode(b64_str))
+                    except ImportError:
+                        log.warning("bonding_curve.zstd_unavailable")
                         return (None,) * 5
-                    # Skip discriminator (8 bytes)
-                    offset = 8
-                    vtr = int.from_bytes(raw[offset:offset + 8], "little"); offset += 8
-                    vsr = int.from_bytes(raw[offset:offset + 8], "little"); offset += 8
-                    rtr = int.from_bytes(raw[offset:offset + 8], "little"); offset += 8
-                    rsr = int.from_bytes(raw[offset:offset + 8], "little"); offset += 8
-                    supply = int.from_bytes(raw[offset:offset + 8], "little"); offset += 8
-                    complete = bool(raw[offset])
-                    # Convert lamports -> SOL
-                    return (rsr / 1e9, rtr, vsr / 1e9, vtr, complete)
-            return (None,) * 5
+            elif isinstance(data_field, dict):
+                # Some RPCs return {'data': {'parsed': ...}} or [b64, enc]
+                inner = data_field.get("parsed", {})
+                if isinstance(inner, dict) and "info" in inner:
+                    # jsonParsed SPL token form — not a bonding curve, bail
+                    return (None,) * 5
+
+            if raw is None or len(raw) < 8 + 5 * 8 + 1:
+                return (None,) * 5
+
+            offset = 8  # skip discriminator
+            vtr = int.from_bytes(raw[offset:offset + 8], "little"); offset += 8
+            vsr = int.from_bytes(raw[offset:offset + 8], "little"); offset += 8
+            rtr = int.from_bytes(raw[offset:offset + 8], "little"); offset += 8
+            rsr = int.from_bytes(raw[offset:offset + 8], "little"); offset += 8
+            supply = int.from_bytes(raw[offset:offset + 8], "little"); offset += 8
+            complete = bool(raw[offset])
+            # SOL reserves are in lamports; token reserves are in raw token units
+            # (pump.fun tokens are 6 decimals, but we return raw counts here and
+            # the consumer divides by 1e9 only for SOL. Token decimals handled by
+            # callers that need human amounts.)
+            return (rsr / 1e9, rtr / 1e6, vsr / 1e9, vtr / 1e6, complete)
         except Exception as e:
             log.warning("bonding_curve.decode_failed", error=str(e))
             return (None,) * 5
