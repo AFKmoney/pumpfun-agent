@@ -1,0 +1,243 @@
+# =========================================================================
+# PUMP.FUN AUTONOMOUS TRADING AGENT - MAIN CONFIG
+# Copy this file to config/config.yaml and fill in your secrets.
+# DO NOT commit the real config.yaml to git.
+# =========================================================================
+
+environment: "production"  # "development" | "production"
+
+# -------------------------------------------------------------------------
+# GLOBAL TRADING PARAMETERS
+# -------------------------------------------------------------------------
+trading:
+  mode: "paper"             # "paper" | "live"  (paper = simulate, no real tx)
+  chains: ["solana"]
+  base_currency_sol: "SOL"
+  base_currency_evm: "WETH"
+
+  # Per-trade fixed sizing (Strategy A)
+  fixed_size_sol: 0.05
+  fixed_size_evm: 0.005
+
+  # Slippage tolerance (bps) - 500 bps = 5%
+  slippage_bps: 800
+  priority_fee_micro_lamports: 50_000   # Solana priority fee
+  gas_price_gwei: 3                     # EVM gas price cap
+
+  # Max simultaneous open positions
+  max_open_positions: 10
+
+# -------------------------------------------------------------------------
+# RISK MANAGEMENT
+# -------------------------------------------------------------------------
+risk:
+  daily_loss_cap_pct: 8.0
+  daily_profit_target_pct: 20.0
+  per_token_max_loss_pct: 15.0
+  per_token_max_hold_minutes: 240
+  blacklist_duration_minutes: 1440
+
+  # Kelly / dynamic sizing (Strategy B)
+  kelly:
+    enabled: true
+    fraction: 0.5              # Half-Kelly
+    min_size_pct: 1.0
+    max_size_pct: 10.0
+    lookback_trades: 50
+
+  # Backtesting guard
+  backtesting:
+    enabled: false             # set true to gate strategies on historical perf
+    min_required_sharpe: 0.8
+    min_required_winrate: 0.40
+    historical_data_days: 30
+
+# -------------------------------------------------------------------------
+# PERSISTENCE (SQLite)
+# -------------------------------------------------------------------------
+persistence:
+  db_path: "./data/agent.db"   # positions, trades, blacklist, daily PnL
+
+# -------------------------------------------------------------------------
+# CHAIN-SPECIFIC CONFIG
+# -------------------------------------------------------------------------
+chains:
+  solana:
+    rpc_endpoints:
+      - "https://mainnet.helius-rpc.com/?api-key=YOUR_HELIUS_KEY"
+      - "https://solana-mainnet.g.alchemy.com/v2/YOUR_ALCHEMY_KEY"
+    ws_endpoint: "wss://mainnet.helius-rpc.com/?api-key=YOUR_HELIUS_KEY"
+    jupiter_api: "https://quote-api.jup.ag/v6"
+    pump_fun_program: "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"
+    dedicated_wallet_seed_env: "SOLANA_WALLET_SEED"
+    allocated_capital_sol: 1.0
+
+  base:
+    rpc_endpoints:
+      - "https://mainnet.base.org"
+    ws_endpoint: "wss://base-mainnet.g.alchemy.com/v2/YOUR_ALCHEMY_KEY"
+    dedicated_wallet_priv_env: "BASE_WALLET_PRIVKEY"
+    allocated_capital_eth: 0.2
+
+  ethereum:
+    rpc_endpoints:
+      - "https://eth.llamarpc.com"
+    dedicated_wallet_priv_env: "ETH_WALLET_PRIVKEY"
+    allocated_capital_eth: 0.1
+
+# -------------------------------------------------------------------------
+# JITO BUNDLES (Solana MEV protection)
+# -------------------------------------------------------------------------
+jito:
+  enabled: true
+  min_size_sol: 0.1          # only use Jito for buys >= 0.1 SOL
+  tip_lamports: 0.001        # tip in SOL (0.001 = 1_000_000 lamports)
+
+# -------------------------------------------------------------------------
+# STRATEGIES
+# -------------------------------------------------------------------------
+strategies:
+  sniping:
+    enabled: true
+    new_pool_scan_interval_sec: 2
+    max_buy_delay_ms: 1500
+    min_initial_liquidity_usd: 5000
+    max_buy_tax_bps: 500
+    require_burned_lp: false
+
+  copy_trade:
+    enabled: false             # enable when you have target wallets configured
+    target_wallets:
+      - "WALLET_ADDRESS_1_PROFICIENT_TRADER"
+      - "WALLET_ADDRESS_2_PROFICIENT_TRADER"
+    min_wallet_winrate: 0.55
+    min_wallet_pnl_30d_usd: 5000
+    follow_delay_ms_max: 3000
+    max_follow_size_sol: 0.2
+
+  momentum:
+    enabled: true
+    scan_interval_sec: 15
+    min_volume_5m_usd: 50000
+    min_price_change_5m_pct: 15.0
+    rsi_period: 14
+    rsi_oversold: 30
+    rsi_overbought: 75
+
+  grid_scalping:
+    enabled: false
+    target_tokens: []
+    grid_levels: 8
+    grid_spacing_pct: 1.5
+    order_size_sol: 0.02
+
+  anti_rugpull:
+    enabled: true
+    min_holders: 50
+    max_top10_holders_pct: 0.40
+    min_liquidity_usd: 10000
+    require_renounced_mint: true
+    require_locked_lp: false
+    check_honeypot: true
+    reject_if_mint_authority_active: true
+
+# -------------------------------------------------------------------------
+# NOTIFICATIONS (TELEGRAM)
+# -------------------------------------------------------------------------
+notifications:
+  telegram:
+    enabled: true
+    bot_token_env: "TELEGRAM_BOT_TOKEN"
+    chat_id_env: "TELEGRAM_CHAT_ID"
+    notify_on:
+      trade_opened: true
+      trade_closed: true
+      stop_loss_hit: true
+      take_profit_hit: true
+      rugpull_detected: true
+      daily_loss_cap_reached: true
+      system_error: true
+    kill_switch_command: "/kill"
+    status_command: "/status"
+
+# -------------------------------------------------------------------------
+# MONITORING / DASHBOARD
+# -------------------------------------------------------------------------
+monitoring:
+  dashboard:
+    enabled: true
+    port: 8080
+    token_env: "DASHBOARD_TOKEN"   # optional, set to require ?token=... for /api/kill
+
+prometheus:
+  enabled: false
+  port: 9090
+
+# -------------------------------------------------------------------------
+# LOGGING
+# -------------------------------------------------------------------------
+logging:
+  level: "INFO"
+  file: "./data/agent.log"
+  max_size_mb: 50
+  backup_count: 5
+  json_format: false
+
+# -------------------------------------------------------------------------
+# SAFETY GUARDS
+# -------------------------------------------------------------------------
+safety:
+  kill_switch_file: "./data/KILL_SWITCH"
+  require_manual_start_confirmation: false
+  max_trade_frequency_per_minute: 10
+  emergency_withdrawal_address: "YOUR_COLD_WALLET_ADDRESS"
+
+# =========================================================================
+# PROFIT OPTIMIZATION MODULES
+# =========================================================================
+
+# -------------------------------------------------------------------------
+# TOKEN SCORING (15+ factor composite score)
+# -------------------------------------------------------------------------
+scoring:
+  min_score_to_buy: 55.0          # tokens below this score are skipped
+  min_score_to_pyramid: 75.0      # tokens above this can be pyramided
+
+# -------------------------------------------------------------------------
+# SMART EXITS (trailing stop, TP ladder, break-even, time decay)
+# -------------------------------------------------------------------------
+smart_exits:
+  break_even_trigger_pct: 25.0    # at +25% PnL, move stop to entry
+  break_even_stop_pct: 0.0        # stop at entry exactly (0% = at entry)
+  trailing_stop_pct: 15.0         # trail 15% below peak after break-even
+  take_profit_ladder:
+    - pnl_pct: 50.0
+      sell_pct: 0.25              # sell 25% at +50%
+    - pnl_pct: 100.0
+      sell_pct: 0.25              # sell 25% at +100%
+    - pnl_pct: 200.0
+      sell_pct: 0.25              # sell 25% at +200%
+                                   # last 25% runs with trailing stop
+  max_hold_minutes_before_decay: 60
+  decay_sell_pct: 0.5             # if flat after 60min, sell 50%
+  migration_pump_hold_minutes: 15 # hold through migration pump
+
+# -------------------------------------------------------------------------
+# PYRAMIDING (DCA on winners)
+# -------------------------------------------------------------------------
+pyramiding:
+  enabled: true
+  min_pnl_pct: 50.0               # only pyramid on positions >= +50%
+  max_additions: 2                # max 2 pyramid buys per position
+  add_size_pct: 0.5               # each pyramid = 50% of original size
+  cooldown_minutes: 15            # wait 15min between pyramids
+
+# -------------------------------------------------------------------------
+# ANTI-SANDWICH (dynamic slippage)
+# -------------------------------------------------------------------------
+anti_sandwich:
+  base_slippage_bps: 300          # 3% default
+  max_slippage_bps: 1500          # 15% cap
+  min_slippage_bps: 50            # 0.5% floor
+  size_liq_threshold: 0.02        # if size < 2% of liq, use tight slippage
+  jito_threshold_sol: 0.1         # use Jito for buys >= 0.1 SOL

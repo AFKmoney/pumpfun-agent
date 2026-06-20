@@ -1,0 +1,14 @@
+# Secrets
+.env
+config/config.yaml
+data/
+*.log
+*.key
+*.pem
+__pycache__/
+*.pyc
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+*.egg-info/
