@@ -114,6 +114,13 @@ strategies:
     min_wallet_pnl_30d_usd: 5000
     follow_delay_ms_max: 3000
     max_follow_size_sol: 0.2
+    # Anti-copy (fade) mode: when these wallets BUY, we AVOID that token.
+    # Loser wallets are more stable than winners (they repeat mistakes), so
+    # fading them is a durable edge. Optional.
+    anti_copy_enabled: true
+    fade_wallets:
+      - "WALLET_ADDRESS_KNOWN_LOSER_1"
+      - "WALLET_ADDRESS_KNOWN_LOSER_2"
 
   momentum:
     enabled: true

@@ -205,7 +205,9 @@ class Orchestrator:
                     SnipingStrategy(adapter, self.signal_queue, anti_rug=self.anti_rugs[chain])
                 )
             if scfg["copy_trade"]["enabled"]:
-                self.strategies.append(CopyTradeStrategy(adapter, self.signal_queue))
+                self.strategies.append(CopyTradeStrategy(
+                    adapter, self.signal_queue, social_graph=self.social_graph,
+                ))
             if scfg["momentum"]["enabled"]:
                 self.strategies.append(MomentumStrategy(adapter, self.signal_queue))
             if scfg["grid_scalping"]["enabled"]:
