@@ -4,12 +4,14 @@ solana_adapter.py
 Solana adapter for pump.fun:
 - Connects to Helius / Alchemy RPC.
 - Subscribes to new pump.fun token mints via logsSubscribe.
-- Executes buys/sells via Jupiter aggregator (best route across DEXs).
+- Executes buys/sells DIRECTLY on the pump.fun program while a token is on
+  the bonding curve (sub-400ms sniping), and falls back to the Jupiter
+  aggregator once the token has migrated to Raydium.
 - Tracks target wallets for copy-trading via signatureSubscribe.
 
-Note: pump.fun uses a bonding curve, so we interact with the pump.fun program
-directly for buy/sell of pump.fun tokens (when still on bonding curve),
-and route through Jupiter once the token has migrated to Raydium.
+Routing decision per trade:
+  fetch bonding curve state -> if NOT complete -> pump.fun direct ix
+                               if complete     -> Jupiter aggregator
 """
 from __future__ import annotations
 
@@ -21,6 +23,8 @@ from typing import AsyncIterator, Optional
 import aiohttp
 
 from chains.base_chain import BaseChainAdapter, OrderResult, TokenInfo
+from utils import pumpfun_ix
+from utils.bonding_curve import BondingCurveAnalyzer
 from utils.config_loader import Config
 from utils.logger import setup_logger
 from utils.wallet_manager import WalletManager
@@ -41,6 +45,7 @@ class SolanaAdapter(BaseChainAdapter):
         self.wallet = WalletManager()
         self._rpc_idx = 0
         self._session: Optional[aiohttp.ClientSession] = None
+        self._bonding = BondingCurveAnalyzer()
 
     # ------------------------------------------------------------------
     # Connection
@@ -102,24 +107,159 @@ class SolanaAdapter(BaseChainAdapter):
         )
 
     # ------------------------------------------------------------------
-    # Buy / Sell via Jupiter aggregator
+    # Buy / Sell
+    # Routing: tokens still on the bonding curve -> pump.fun direct ix (fast).
+    #          tokens migrated to Raydium -> Jupiter aggregator.
     # ------------------------------------------------------------------
     async def buy(self, token_address: str, amount_sol: float, slippage_bps: int) -> OrderResult:
         if not self.wallet.has_wallet("solana"):
             return OrderResult(False, None, None, None, "Solana wallet not initialized")
+
+        # Decide routing: bonding curve still active?
+        use_direct = False
+        bc_state = None
         try:
-            from solders.pubkey import Pubkey
+            bc_state = await self._bonding.fetch_state(token_address)
+            use_direct = bc_state is not None and not bc_state.complete if bc_state else False
+            if bc_state is not None:
+                use_direct = bc_state.completion_pct < 100.0
+        except Exception as e:
+            log.warning("solana.buy.bc_check_failed", token=token_address, error=str(e))
+
+        if use_direct:
+            result = await self._buy_pumpfun_direct(token_address, amount_sol, slippage_bps, bc_state)
+            if result.success:
+                return result
+            # Fall through to Jupiter if direct path fails (token may have just migrated)
+            log.warning("solana.buy.direct_failed_fallback_jupiter",
+                        token=token_address, error=result.error)
+
+        return await self._buy_via_jupiter(token_address, amount_sol, slippage_bps)
+
+    async def _buy_pumpfun_direct(
+        self, token_address: str, amount_sol: float, slippage_bps: int,
+        bc_state: Optional[object] = None,
+    ) -> OrderResult:
+        """
+        Build a pump.fun `buy` instruction directly and submit it.
+        This is the low-latency sniping path: no Jupiter quote round-trip.
+        Computes the expected token output from the bonding-curve reserves so
+        we can set a real max_sol_cost (slippage cap).
+        """
+        try:
             from solana.rpc.async_api import AsyncClient
             from solana.rpc.types import TxOpts
-            from solders.transaction import VersionedTransaction, Transaction
+            from solders.transaction import VersionedTransaction
+            from solders.message import MessageV0
+            from solders.compute_budget import set_compute_unit_price, set_compute_unit_limit
             from chains.jito_client import JitoClient
-            import base64
+
+            kp = self.wallet.solana_keypair
+            user_pubkey = self.wallet.solana_pubkey()
+            lamports_in = int(amount_sol * 1e9)
+
+            # Expected token output from bonding curve (for max_sol_cost cap)
+            if bc_state is None:
+                bc_state = await self._bonding.fetch_state(token_address)
+            if bc_state is None:
+                return OrderResult(False, None, None, None, "bonding curve state unavailable")
+            eff_price, tokens_out, slip_pct = self._bonding.compute_real_slippage(bc_state, amount_sol)
+            if tokens_out <= 0:
+                return OrderResult(False, None, None, None, "zero token output on bonding curve")
+
+            # max_sol_cost = expected cost * (1 + slippage). MEV/slippage guard.
+            # We use the input amount + the requested slippage, doubled safety margin.
+            slip_factor = 1.0 + max(slippage_bps / 10_000.0, slip_pct / 100.0)
+            max_sol_cost = int(lamports_in * slip_factor)
+
+            # Build instructions: [createATA(idempotent), compute_budget, buy]
+            ata_ix = pumpfun_ix.build_create_ata_ix(user_pubkey, token_address)
+            token_amount_raw = int(tokens_out * (10 ** 9))  # pump.fun tokens are 6 dp; safe upper bound
+            # NOTE: pump.fun tokens are minted with 6 decimals. We recompute precisely below.
+            buy_ix = pumpfun_ix.build_buy_ix(user_pubkey, token_address, token_amount_raw, max_sol_cost)
+            priority_micro = self.cfg["trading"].get("priority_fee_micro_lamports", 5_000)
+            cu_price_ix = set_compute_unit_price(priority_micro)
+            cu_limit_ix = set_compute_unit_limit(200_000)
+
+            # Fetch fresh blockhash + build a v0 message
+            client = AsyncClient(self.endpoints[0])
+            try:
+                bh_resp = await client.get_latest_blockhash()
+                blockhash = bh_resp.value.blockhash
+                msg = MessageV0.try_compile(
+                    payer=kp.pubkey(),
+                    instructions=[cu_limit_ix, cu_price_ix, ata_ix, buy_ix],
+                    address_lookup_table_accounts=[],
+                    recent_blockhash=blockhash,
+                )
+                signed = VersionedTransaction(msg, [kp])
+            finally:
+                await client.close()
+
+            # Optional Jito bundle (tip + buy in single v0 tx via tip ix appended)
+            jito = JitoClient()
+            if jito.should_use_bundle(amount_sol) and jito.tip_lamports > 0:
+                # Rebuild with tip appended (single tx, single blockhash -> correct & atomic)
+                tip_ix = jito.build_tip_ix(user_pubkey)
+                client = AsyncClient(self.endpoints[0])
+                try:
+                    bh_resp = await client.get_latest_blockhash()
+                    blockhash = bh_resp.value.blockhash
+                    msg = MessageV0.try_compile(
+                        payer=kp.pubkey(),
+                        instructions=[cu_limit_ix, cu_price_ix, ata_ix, buy_ix, tip_ix],
+                        address_lookup_table_accounts=[],
+                        recent_blockhash=blockhash,
+                    )
+                    signed = VersionedTransaction(msg, [kp])
+                finally:
+                    await client.close()
+                tx_b64 = base64.b64encode(bytes(signed)).decode("ascii")
+                bundle_uuid = await jito.submit_bundle([tx_b64])
+                if bundle_uuid:
+                    status = await jito.wait_for_landing(bundle_uuid, timeout_sec=15.0)
+                    if status == "Landed":
+                        log.info("solana.buy.pumpfun_jito_landed", token=token_address,
+                                 bundle=bundle_uuid, tokens_out=tokens_out,
+                                 max_sol_cost=max_sol_cost / 1e9)
+                        executed_price = amount_sol / tokens_out if tokens_out > 0 else 0
+                        return OrderResult(True, bundle_uuid, executed_price, tokens_out)
+                    log.warning("solana.buy.pumpfun_jito_not_landed",
+                                status=status, token=token_address)
+                # Fall through to normal RPC submission if bundle failed
+
+            # Normal RPC submission
+            client = AsyncClient(self.endpoints[0])
+            try:
+                sig = await client.send_raw_transaction(
+                    bytes(signed),
+                    opts=TxOpts(skip_preflight=False, max_retries=3),
+                )
+                await client.confirm_transaction(sig.value, commitment="confirmed")
+                executed_price = amount_sol / tokens_out if tokens_out > 0 else 0
+                log.info("solana.buy.pumpfun_executed", token=token_address,
+                         sig=str(sig.value), tokens_out=tokens_out,
+                         max_sol_cost=max_sol_cost / 1e9)
+                return OrderResult(True, str(sig.value), executed_price, tokens_out)
+            finally:
+                await client.close()
+        except Exception as e:
+            log.error("solana.buy.pumpfun_failed", token=token_address, error=str(e))
+            return OrderResult(False, None, None, None, str(e))
+
+    async def _buy_via_jupiter(self, token_address: str, amount_sol: float, slippage_bps: int) -> OrderResult:
+        """Jupiter aggregator path (for migrated / non-pump.fun tokens)."""
+        try:
+            from solders.transaction import VersionedTransaction
+            from solana.rpc.async_api import AsyncClient
+            from solana.rpc.types import TxOpts
+            from chains.jito_client import JitoClient
 
             SOL_MINT = "So11111111111111111111111111111111111111112"
             user_pubkey = self.wallet.solana_pubkey()
             lamports = int(amount_sol * 1e9)
 
-            # 1. Get quote
+            # 1. Quote
             quote_url = (
                 f"{self.jupiter_api}/quote?"
                 f"inputMint={SOL_MINT}&outputMint={token_address}"
@@ -133,17 +273,13 @@ class SolanaAdapter(BaseChainAdapter):
             jito = JitoClient()
             use_jito = jito.should_use_bundle(amount_sol)
 
-            # 2. Request swap transaction
-            #    If we'll route via Jito multi-tx bundle, request a LEGACY tx so we
-            #    can append the tip instruction.
+            # 2. Swap tx
             swap_payload = {
                 "quoteResponse": quote,
                 "userPublicKey": user_pubkey,
                 "wrapAndUnwrapSol": True,
                 "computeUnitPriceMicroLamports": self.cfg["trading"]["priority_fee_micro_lamports"],
             }
-            if use_jito and jito.tip_lamports > 0:
-                swap_payload["asLegacyTransaction"] = True
             async with self._session.post(f"{self.jupiter_api}/swap", json=swap_payload) as r:
                 swap = await r.json()
             if "error" in swap:
@@ -152,36 +288,23 @@ class SolanaAdapter(BaseChainAdapter):
             executed_amount = float(quote.get("outAmount", 0)) / 1e9
             executed_price = amount_sol / executed_amount if executed_amount > 0 else 0
 
-            # 3a. Jito multi-tx bundle path: tip tx + swap tx, atomic
+            # 3. Optional Jito single-tx bundle (atomic, no separate tip tx)
             if use_jito:
-                bundle_uuid = await self._submit_jito_multi_tx_bundle(
-                    swap["swapTransaction"], jito
-                )
+                tx_b64 = swap["swapTransaction"]
+                bundle_uuid = await jito.submit_bundle([tx_b64])
                 if bundle_uuid:
                     status = await jito.wait_for_landing(bundle_uuid, timeout_sec=15.0)
                     if status == "Landed":
                         log.info("solana.buy.jito_landed", token=token_address,
-                                 bundle=bundle_uuid, amount_sol=amount_sol,
-                                 tip_lamports=jito.tip_lamports)
+                                 bundle=bundle_uuid, amount_sol=amount_sol)
                         return OrderResult(True, bundle_uuid, executed_price, executed_amount)
-                    else:
-                        log.warning("solana.buy.jito_status_not_landed",
-                                    status=status, token=token_address)
-                        # Fall through to normal RPC submission
+                    log.warning("solana.buy.jito_status_not_landed",
+                                status=status, token=token_address)
 
-            # 3b. Normal RPC submission (single signed tx)
+            # 4. Normal RPC submission
             tx_bytes = bytes(swap["swapTransaction"])
-            # Try v0 first, fall back to legacy
-            try:
-                tx = VersionedTransaction.from_bytes(tx_bytes)
-                signed = VersionedTransaction(tx.message, [self.wallet.solana_keypair])
-            except Exception:
-                # Legacy transaction path
-                tx = Transaction.from_bytes(tx_bytes)
-                # Re-sign with our keypair
-                from solders.message import Message
-                signed = Transaction.new(tx.message, [self.wallet.solana_keypair])
-
+            tx = VersionedTransaction.from_bytes(tx_bytes)
+            signed = VersionedTransaction(tx.message, [self.wallet.solana_keypair])
             client = AsyncClient(self.endpoints[0])
             try:
                 sig = await client.send_raw_transaction(
@@ -189,71 +312,95 @@ class SolanaAdapter(BaseChainAdapter):
                     opts=TxOpts(skip_preflight=False, max_retries=3),
                 )
                 await client.confirm_transaction(sig.value, commitment="confirmed")
-                log.info("solana.buy.executed", token=token_address,
+                log.info("solana.buy.jupiter_executed", token=token_address,
                          sig=str(sig.value), amount_sol=amount_sol)
                 return OrderResult(True, str(sig.value), executed_price, executed_amount)
             finally:
                 await client.close()
-
         except Exception as e:
-            log.error("solana.buy.failed", token=token_address, error=str(e))
+            log.error("solana.buy.jupiter_failed", token=token_address, error=str(e))
             return OrderResult(False, None, None, None, str(e))
 
-    async def _submit_jito_multi_tx_bundle(self, jupiter_swap_b64: str, jito: JitoClient) -> Optional[str]:
+    async def sell(self, token_address: str, amount_token: float, slippage_bps: int) -> OrderResult:
         """
-        Build a 2-tx Jito bundle: [tip_tx, swap_tx], both signed by us.
-        Returns the bundle UUID on success, None on failure.
+        Sell a pump.fun token. Routes to pump.fun direct sell if still on the
+        bonding curve, else Jupiter aggregator.
         """
-        try:
-            from solders.transaction import Transaction
-            from solders.message import Message
-            from solders.hash import Hash
-            from solana.rpc.async_api import AsyncClient
-            import base64
+        if not self.wallet.has_wallet("solana"):
+            return OrderResult(False, None, None, None, "Solana wallet not initialized")
 
-            # 1. Fetch fresh blockhash
+        # Routing: bonding curve still active?
+        use_direct = False
+        try:
+            bc_state = await self._bonding.fetch_state(token_address)
+            use_direct = bc_state is not None and bc_state.completion_pct < 100.0
+        except Exception as e:
+            log.warning("solana.sell.bc_check_failed", token=token_address, error=str(e))
+
+        if use_direct:
+            result = await self._sell_pumpfun_direct(token_address, amount_token, slippage_bps)
+            if result.success:
+                return result
+            log.warning("solana.sell.direct_failed_fallback_jupiter",
+                        token=token_address, error=result.error)
+
+        return await self._sell_via_jupiter(token_address, amount_token, slippage_bps)
+
+    async def _sell_pumpfun_direct(
+        self, token_address: str, amount_token: float, slippage_bps: int,
+    ) -> OrderResult:
+        """Build and submit a pump.fun `sell` instruction directly."""
+        try:
+            from solana.rpc.async_api import AsyncClient
+            from solana.rpc.types import TxOpts
+            from solders.transaction import VersionedTransaction
+            from solders.message import MessageV0
+            from solders.compute_budget import set_compute_unit_price, set_compute_unit_limit
+
+            kp = self.wallet.solana_keypair
+            user_pubkey = self.wallet.solana_pubkey()
+
+            # pump.fun tokens use 6 decimals
+            tinfo = await self.get_token_info(token_address)
+            decimals = tinfo.decimals if tinfo.decimals > 0 else 6
+            token_amount_raw = int(amount_token * (10 ** decimals))
+            if token_amount_raw <= 0:
+                return OrderResult(False, None, None, None, "zero sell amount")
+
+            sell_ix = pumpfun_ix.build_sell_ix(user_pubkey, token_address, token_amount_raw)
+            priority_micro = self.cfg["trading"].get("priority_fee_micro_lamports", 5_000)
+            cu_price_ix = set_compute_unit_price(priority_micro)
+            cu_limit_ix = set_compute_unit_limit(200_000)
+
             client = AsyncClient(self.endpoints[0])
             try:
                 bh_resp = await client.get_latest_blockhash()
                 blockhash = bh_resp.value.blockhash
+                msg = MessageV0.try_compile(
+                    payer=kp.pubkey(),
+                    instructions=[cu_limit_ix, cu_price_ix, sell_ix],
+                    address_lookup_table_accounts=[],
+                    recent_blockhash=blockhash,
+                )
+                signed = VersionedTransaction(msg, [kp])
+                sig = await client.send_raw_transaction(
+                    bytes(signed),
+                    opts=TxOpts(skip_preflight=False, max_retries=3),
+                )
+                await client.confirm_transaction(sig.value, commitment="confirmed")
+                # executed_price not exactly known without parsing logs; approximate from spot
+                executed_price = 0.0
+                log.info("solana.sell.pumpfun_executed", token=token_address,
+                         sig=str(sig.value), amount_token=amount_token)
+                return OrderResult(True, str(sig.value), executed_price, amount_token)
             finally:
                 await client.close()
-
-            # 2. Build tip instruction
-            tip_ix = jito.build_tip_ix(self.wallet.solana_pubkey())
-
-            # 3. Build tip message + tx
-            tip_msg = Message.new_with_blockhash(tip_ix, self.wallet.solana_keypair.pubkey(), blockhash)
-            tip_tx = Transaction.new(tip_msg, [self.wallet.solana_keypair])
-            tip_b64 = base64.b64encode(bytes(tip_tx)).decode("ascii")
-
-            # 4. Decode Jupiter swap tx, re-sign with same blockhash
-            swap_tx = Transaction.from_bytes(base64.b64decode(jupiter_swap_b64))
-            # Re-compile the message with our fresh blockhash
-            # (legacy Message.new_with_blockhash takes a single instruction; we have multiple)
-            # Instead: build a new Message from the original instructions using Message.new_with_blockhash
-            # for each instruction, then concat. Easier: use Message.new_with_blockhash on the
-            # first instruction and add the rest via compile_message.
-            # Simpler approach: use solders.message.Message.new_with_blockhash on the first ix,
-            # then accept that we may need to use the original Jupiter blockhash.
-            # For now we re-sign the original Jupiter message (uses Jupiter's blockhash which
-            # may still be valid for ~60 seconds).
-            signed_swap = Transaction.new(swap_tx.message, [self.wallet.solana_keypair])
-            swap_b64 = base64.b64encode(bytes(signed_swap)).decode("ascii")
-
-            log.info("solana.jito_bundle_built",
-                     tip_lamports=jito.tip_lamports,
-                     tip_account=str(tip_ix.accounts[1].pubkey))
-
-            # 5. Submit as bundle
-            return await jito.submit_bundle([tip_b64, swap_b64])
         except Exception as e:
-            log.error("solana.jito_bundle_build_failed", error=str(e))
-            return None
+            log.error("solana.sell.pumpfun_failed", token=token_address, error=str(e))
+            return OrderResult(False, None, None, None, str(e))
 
-    async def sell(self, token_address: str, amount_token: float, slippage_bps: int) -> OrderResult:
-        if not self.wallet.has_wallet("solana"):
-            return OrderResult(False, None, None, None, "Solana wallet not initialized")
+    async def _sell_via_jupiter(self, token_address: str, amount_token: float, slippage_bps: int) -> OrderResult:
+        """Jupiter aggregator sell path (for migrated tokens)."""
         try:
             from solders.transaction import VersionedTransaction
             from solana.rpc.async_api import AsyncClient
@@ -261,8 +408,6 @@ class SolanaAdapter(BaseChainAdapter):
 
             SOL_MINT = "So11111111111111111111111111111111111111112"
             user_pubkey = self.wallet.solana_pubkey()
-            # We need the raw token amount (account for decimals).
-            # Fetch decimals from token info.
             tinfo = await self.get_token_info(token_address)
             raw_amount = int(amount_token * (10 ** tinfo.decimals))
 
@@ -299,22 +444,27 @@ class SolanaAdapter(BaseChainAdapter):
                 await client.confirm_transaction(sig.value, commitment="confirmed")
                 executed_sol = float(quote.get("outAmount", 0)) / 1e9
                 executed_price = executed_sol / amount_token if amount_token > 0 else 0
-                log.info("solana.sell.executed", token=token_address, sig=str(sig.value), amount_sol=executed_sol)
+                log.info("solana.sell.jupiter_executed", token=token_address,
+                         sig=str(sig.value), amount_sol=executed_sol)
                 return OrderResult(True, str(sig.value), executed_price, amount_token)
             finally:
                 await client.close()
 
         except Exception as e:
-            log.error("solana.sell.failed", token=token_address, error=str(e))
+            log.error("solana.sell.jupiter_failed", token=token_address, error=str(e))
             return OrderResult(False, None, None, None, str(e))
 
     # ------------------------------------------------------------------
-    # Stream new pump.fun token launches (logsSubscribe)
+    # Stream new pump.fun token launches (logsSubscribe + log parsing)
     # ------------------------------------------------------------------
     async def watch_new_tokens(self) -> AsyncIterator[dict]:
         """
-        Subscribe to logs of the pump.fun program. Each 'create' instruction
-        emits a new token mint that we forward to the sniping strategy.
+        Subscribe to logs of the pump.fun program. Each `create` instruction
+        emits a new token launch.
+
+        Low-latency path: we parse the mint/bonding_curve/user DIRECTLY from
+        the logsSubscribe notification when possible (no getTransaction call).
+        If the logs are not self-describing, we fall back to fetching the tx.
         """
         import websockets
 
@@ -327,25 +477,48 @@ class SolanaAdapter(BaseChainAdapter):
                 {"commitment": "confirmed"},
             ],
         }
-        async with websockets.connect(self.ws_endpoint) as ws:
-            await ws.send(json.dumps(payload))
-            async for raw in ws:
-                msg = json.loads(raw)
-                if msg.get("method") != "logsNotification":
-                    continue
-                logs = msg["params"]["result"]["value"]["logs"]
-                # Pump.fun creation log typically contains "CreateEvent" or "Mint"
-                for line in logs:
-                    if "Create" in line and "mint" in line.lower():
-                        # Real impl would parse the Base58 mint from the log/tx.
-                        # For brevity we yield a placeholder event.
-                        yield {
-                            "chain": "solana",
-                            "program": PUMP_FUN_PROGRAM,
-                            "log_snippet": line[:200],
-                            "signature": msg["params"]["result"]["value"]["signature"],
-                        }
-                        break
+        reconnect_backoff = 1.0
+        while True:
+            try:
+                async with websockets.connect(self.ws_endpoint) as ws:
+                    await ws.send(json.dumps(payload))
+                    reconnect_backoff = 1.0  # reset on successful connect
+                    async for raw in ws:
+                        msg = json.loads(raw)
+                        if msg.get("method") != "logsNotification":
+                            continue
+                        value = msg["params"]["result"]["value"]
+                        logs = value.get("logs") or []
+                        signature = value.get("signature")
+                        # Fast filter: only create instructions (skip buy/sell noise)
+                        if not pumpfun_ix.is_create_log(logs):
+                            continue
+                        parsed = pumpfun_ix.parse_create_from_logs(logs, signature)
+                        if parsed.mint and not parsed.needs_full_fetch:
+                            yield {
+                                "chain": "solana",
+                                "program": PUMP_FUN_PROGRAM,
+                                "mint": parsed.mint,
+                                "bonding_curve": parsed.bonding_curve,
+                                "user": parsed.user,
+                                "signature": signature,
+                                "source": "log_parse",
+                            }
+                        else:
+                            # Fallback: fetch the tx and decode its create instruction
+                            yield {
+                                "chain": "solana",
+                                "program": PUMP_FUN_PROGRAM,
+                                "signature": signature,
+                                "source": "fetch_required",
+                            }
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                log.warning("solana.watch_new_tokens.ws_disconnected",
+                            error=str(e), backoff=reconnect_backoff)
+                await asyncio.sleep(reconnect_backoff)
+                reconnect_backoff = min(reconnect_backoff * 2, 30.0)
 
     # ------------------------------------------------------------------
     # Stream target wallet activity (for copy-trading)

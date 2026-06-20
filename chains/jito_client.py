@@ -95,25 +95,33 @@ class JitoClient:
         lamports = tip_lamports if tip_lamports is not None else self.tip_lamports
         return transfer(TransferParams(from_pubkey=payer, to_pubkey=tip_account, lamports=lamports))
 
-    async def build_multi_tx_bundle(self, jupiter_swap_b64: str, payer_keypair) -> Optional[list[str]]:
+    async def build_multi_tx_bundle(self, swap_b64: str, payer_keypair) -> Optional[list[str]]:
         """
-        Build a 2-tx bundle: [tip_tx, swap_tx] both signed by the same payer.
-        Atomicity: either both land or neither does.
+        Build a 2-tx Jito bundle: [tip_tx, swap_tx], both signed by the same
+        payer, both using a SINGLE fresh blockhash so they are atomic.
+
+        IMPORTANT: For v0 (versioned) transactions, re-signing with a different
+        blockhash requires recompiling the message. This implementation therefore
+        re-fetches a single fresh blockhash, builds the tip tx on it, and submits
+        the swap tx using its OWN blockhash (the one Jupiter returned). Jito
+        accepts bundles whose transactions use different blockhashes as long as
+        both are still valid (~60s). For true same-blockhash atomicity, the
+        caller should instead append the tip ix INTO the swap tx and submit as a
+        single-tx bundle — which is what the new pump.fun direct buy path does.
 
         Args:
-            jupiter_swap_b64: base64 of Jupiter's swap transaction (must be a legacy tx,
-                              request with `asLegacyTransaction: true` from Jupiter API).
-            payer_keypair:    solders.keypair.Keypair of the payer.
+            swap_b64: base64 of a SIGNED swap transaction (Jupiter or pump.fun direct).
+            payer_keypair: solders.keypair.Keypair of the payer/tip source.
 
         Returns:
             list of base64-encoded signed transactions, or None on failure.
         """
         try:
             from solders.transaction import Transaction
-            from solders.hash import Hash
+            from solders.message import Message
             from solana.rpc.async_api import AsyncClient
 
-            # 1. Fetch fresh blockhash for both txs
+            # 1. Fresh blockhash for the tip tx
             client = AsyncClient(self.cfg["chains"]["solana"]["rpc_endpoints"][0])
             try:
                 recent_blockhash_resp = await client.get_latest_blockhash()
@@ -121,37 +129,17 @@ class JitoClient:
             finally:
                 await client.close()
 
-            # 2. Build tip tx
+            # 2. Build & sign the tip tx with the fresh blockhash
             tip_ix = self.build_tip_ix(str(payer_keypair.pubkey()))
-            tip_msg = MessageV0.try_compile(
-                payer=payer_keypair.pubkey(),
-                instructions=[tip_ix],
-                address_lookup_table_accounts=[],
-                recent_blockhash=blockhash,
-            ) if False else None  # use legacy message for simplicity
-
-            # Use legacy Message (solders.message.Message)
-            from solders.message import Message
-            tip_msg = Message.new_with_blockhash(tip_ix, payer_keypair.pubkey(), blockhash)
+            tip_msg = Message.new_with_blockhash(
+                tip_ix, payer_keypair.pubkey(), blockhash,
+            )
             tip_tx = Transaction.new(tip_msg, [payer_keypair])
             tip_b64 = base64.b64encode(bytes(tip_tx)).decode("ascii")
 
-            # 3. Decode Jupiter swap tx and re-sign with same blockhash
-            swap_tx = Transaction.from_bytes(base64.b64decode(jupiter_swap_b64))
-            # Re-sign the swap with our keypair (Jupiter returns unsigned or partially signed)
-            # We assume Jupiter returns a tx we can re-sign by replacing the message's blockhash.
-            # For v0 txs this would require recompiling the message; for legacy it's straightforward.
-            try:
-                # Try legacy first
-                swap_msg = swap_tx.message
-                # Re-sign with the same keypair (creates a new signature)
-                signed_swap = Transaction.new(swap_msg, [payer_keypair])
-                swap_b64 = base64.b64encode(bytes(signed_swap)).decode("ascii")
-            except Exception:
-                # v0 transaction: just re-use the original signed bytes
-                # (assumes Jupiter already signed it correctly for our pubkey)
-                swap_b64 = jupiter_swap_b64
-
+            # 3. Swap tx: submitted as-is (already signed by the caller).
+            #    We do NOT re-sign — re-signing a v0 tx with a different blockhash
+            #    is invalid. Jito accepts multi-blockhash bundles.
             log.info("jito.multi_tx_built",
                      tip_lamports=self.tip_lamports,
                      tip_account=tip_ix.accounts[1].pubkey)
