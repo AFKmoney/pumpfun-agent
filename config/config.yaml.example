@@ -241,3 +241,16 @@ anti_sandwich:
   min_slippage_bps: 50            # 0.5% floor
   size_liq_threshold: 0.02        # if size < 2% of liq, use tight slippage
   jito_threshold_sol: 0.1         # use Jito for buys >= 0.1 SOL
+
+# -------------------------------------------------------------------------
+# ANALYTICS PIPELINE (feeds the AlphaSignal brain with real data)
+# Without these, all analyzers collapse to neutral-50 fallbacks.
+# -------------------------------------------------------------------------
+analysis:
+  lifecycle_observation_interval_sec: 30   # how often to sample holders/price/trades
+  sentiment_poll_interval_sec: 120          # how often to poll Twitter/Telegram
+  sentiment:
+    telegram_chat_ids: []                   # list of chat IDs to monitor, e.g. ["-1001234567890"]
+# Required env vars for sentiment (optional, but without them sentiment=0):
+#   TWITTER_BEARER_TOKEN     (Twitter API v2)
+#   TELEGRAM_BOT_TOKEN       (already used for notifications)

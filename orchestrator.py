@@ -44,6 +44,7 @@ from analysis.mev_detector import MevDetector
 from analysis.order_flow import OrderFlowAnalyzer
 from analysis.sentiment import SentimentAnalyzer
 from analysis.social_graph import SocialGraphAnalyzer
+from utils.analytics_pipeline import AnalyticsPipeline
 from utils.anti_sandwich import AntiSandwich
 from utils.bonding_curve import BondingCurveAnalyzer
 from utils.config_hot_reload import ConfigHotReloader
@@ -104,6 +105,18 @@ class Orchestrator:
             sentiment=self.sentiment,
             bonding=self.bonding,
             mev_detector=self.mev_detector,
+        )
+
+        # Live data ingestion pipeline that feeds the analyzers (order_flow,
+        # lifecycle, social_graph, sentiment) with real-time + periodic data.
+        # Without it, AlphaSignal collapses to neutral-50 fallbacks.
+        self.analytics_pipeline = AnalyticsPipeline(
+            order_flow=self.order_flow,
+            lifecycle=self.lifecycle,
+            social_graph=self.social_graph,
+            sentiment=self.sentiment,
+            bonding=self.bonding,
+            risk_positions_ref=lambda: self.risk.positions,
         )
 
         self._tasks: list[asyncio.Task] = []
@@ -206,11 +219,17 @@ class Orchestrator:
         for s in self.strategies:
             self._tasks.append(asyncio.create_task(s.run()))
 
+        # Start the analytics ingestion pipeline (feeds order_flow / lifecycle /
+        # social_graph / sentiment so AlphaSignal has real data instead of
+        # neutral-50 fallbacks).
+        await self.analytics_pipeline.start()
+
         self.state = "RUNNING"
         log.info("orchestrator.running",
                  strategies=[s.name for s in self.strategies],
                  smart_exits=True, dev_tracker=True, gas_optimizer=True,
-                 migration_detector=True, pyramider=True)
+                 migration_detector=True, pyramider=True,
+                 analytics_pipeline=True)
 
         stop_t = asyncio.create_task(self._stop_event.wait())
         kill_t = asyncio.create_task(self._wait_kill())
@@ -366,6 +385,7 @@ class Orchestrator:
         self.state = "STOPPING"
         if self._dashboard_task:
             self._dashboard_task.cancel()
+        await self.analytics_pipeline.stop()
         await self.dev_tracker.stop_all()
         for t in self._tasks:
             t.cancel()
