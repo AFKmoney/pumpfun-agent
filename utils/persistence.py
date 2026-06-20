@@ -73,6 +73,40 @@ CREATE TABLE IF NOT EXISTS agent_state (
     key TEXT PRIMARY KEY,
     value TEXT
 );
+
+-- Attribution: per-trade features at buy time + realized pnl at close.
+-- Drives the weekly AlphaSignal weight re-tuning (utils/attribution.py).
+CREATE TABLE IF NOT EXISTS trade_features (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    chain TEXT NOT NULL,
+    token TEXT NOT NULL,
+    strategy TEXT NOT NULL,           -- signal source (sniping/momentum/copy/...)
+    entry_ts REAL NOT NULL,
+    -- per-analyzer scores captured at buy time
+    alpha_score REAL,
+    order_flow_score REAL,
+    smart_money_score REAL,
+    token_quality_score REAL,
+    lifecycle_score REAL,
+    liquidity_score REAL,
+    sentiment_score REAL,
+    bonding_curve_score REAL,
+    mev_penalty_score REAL,
+    -- realized outcome (filled on close)
+    exit_ts REAL,
+    pnl_pct REAL,
+    profitable INTEGER                -- 0/1/NULL (NULL = still open)
+);
+CREATE INDEX IF NOT EXISTS idx_trade_features_token ON trade_features(token);
+CREATE INDEX IF NOT EXISTS idx_trade_features_strategy ON trade_features(strategy);
+CREATE INDEX IF NOT EXISTS idx_trade_features_ts ON trade_features(entry_ts);
+
+-- Tuned AlphaSignal weights (single row, updated by the weekly job).
+CREATE TABLE IF NOT EXISTS alpha_weights (
+    key TEXT PRIMARY KEY,             -- component name
+    weight REAL NOT NULL,
+    updated_at REAL NOT NULL
+);
 """
 
 
@@ -235,6 +269,77 @@ class Persistence:
                 INSERT INTO agent_state (key, value) VALUES (?, ?)
                 ON CONFLICT(key) DO UPDATE SET value=excluded.value
             """, (key, value))
+
+    # ------------------------------------------------------------------
+    # Trade features (attribution + weight re-tuning)
+    # ------------------------------------------------------------------
+    def insert_trade_features(self, features: dict) -> None:
+        """Insert a trade_features row at buy time (profitable left NULL)."""
+        with self._cursor() as cur:
+            cur.execute("""
+                INSERT INTO trade_features
+                    (chain, token, strategy, entry_ts, alpha_score,
+                     order_flow_score, smart_money_score, token_quality_score,
+                     lifecycle_score, liquidity_score, sentiment_score,
+                     bonding_curve_score, mev_penalty_score)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                features["chain"], features["token"], features["strategy"],
+                features["entry_ts"], features.get("alpha_score"),
+                features.get("order_flow_score"), features.get("smart_money_score"),
+                features.get("token_quality_score"), features.get("lifecycle_score"),
+                features.get("liquidity_score"), features.get("sentiment_score"),
+                features.get("bonding_curve_score"), features.get("mev_penalty_score"),
+            ))
+
+    def close_trade_features(self, chain: str, token: str, entry_ts: float,
+                             exit_ts: float, pnl_pct: float) -> int:
+        """
+        Mark the most recent open trade_features row for (chain, token, entry_ts)
+        as closed with the realized pnl. Returns rows updated.
+        """
+        with self._cursor() as cur:
+            cur.execute("""
+                UPDATE trade_features
+                SET exit_ts=?, pnl_pct=?, profitable=?
+                WHERE chain=? AND token=? AND entry_ts=?
+                  AND profitable IS NULL
+                ORDER BY id DESC LIMIT 1
+            """, (exit_ts, pnl_pct, 1 if pnl_pct > 0 else 0,
+                  chain, token, entry_ts))
+            return cur.rowcount
+
+    def load_closed_trade_features(self, since_ts: float = 0.0, limit: int = 5000) -> list[dict]:
+        """Load closed trade features for weight fitting."""
+        with self._cursor() as cur:
+            cur.execute("""
+                SELECT * FROM trade_features
+                WHERE profitable IS NOT NULL AND entry_ts >= ?
+                ORDER BY entry_ts DESC LIMIT ?
+            """, (since_ts, limit))
+            return [dict(r) for r in cur.fetchall()]
+
+    # ------------------------------------------------------------------
+    # Alpha weights (dynamic, re-tuned weekly)
+    # ------------------------------------------------------------------
+    def load_alpha_weights(self) -> Optional[dict[str, float]]:
+        with self._cursor() as cur:
+            cur.execute("SELECT key, weight FROM alpha_weights")
+            rows = cur.fetchall()
+            if not rows:
+                return None
+            return {r["key"]: r["weight"] for r in rows}
+
+    def upsert_alpha_weights(self, weights: dict[str, float]) -> None:
+        now = time.time()
+        with self._cursor() as cur:
+            for key, weight in weights.items():
+                cur.execute("""
+                    INSERT INTO alpha_weights (key, weight, updated_at)
+                    VALUES (?, ?, ?)
+                    ON CONFLICT(key) DO UPDATE SET
+                        weight=excluded.weight, updated_at=excluded.updated_at
+                """, (key, weight, now))
 
     def close(self) -> None:
         self._conn.close()

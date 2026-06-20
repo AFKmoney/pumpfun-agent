@@ -46,6 +46,7 @@ from analysis.sentiment import SentimentAnalyzer
 from analysis.social_graph import SocialGraphAnalyzer
 from utils.analytics_pipeline import AnalyticsPipeline
 from utils.anti_sandwich import AntiSandwich
+from utils.attribution import AutoTuner
 from utils.bonding_curve import BondingCurveAnalyzer
 from utils.config_hot_reload import ConfigHotReloader
 from utils.config_loader import Config
@@ -119,6 +120,10 @@ class Orchestrator:
             risk_positions_ref=lambda: self.risk.positions,
         )
 
+        # Weekly AlphaSignal weight re-tuner (closed-loop learning: which of
+        # our own signal components actually predict profitable trades).
+        self.autotuner = AutoTuner(self.alpha_signal)
+
         self._tasks: list[asyncio.Task] = []
         self._stop_event = asyncio.Event()
         self.state = "INIT"
@@ -163,6 +168,7 @@ class Orchestrator:
                 dev_tracker=self.dev_tracker,
                 gas_optimizer=self.gas_optimizer,
                 anti_sandwich=self.anti_sandwich,
+                alpha_signal=self.alpha_signal,
             )
 
         # Register migration detector callback -> notify + extend hold time
@@ -223,6 +229,8 @@ class Orchestrator:
         # social_graph / sentiment so AlphaSignal has real data instead of
         # neutral-50 fallbacks).
         await self.analytics_pipeline.start()
+        # Start the weekly weight re-tuner (closed-loop learning).
+        await self.autotuner.start()
 
         self.state = "RUNNING"
         log.info("orchestrator.running",
@@ -386,6 +394,7 @@ class Orchestrator:
         if self._dashboard_task:
             self._dashboard_task.cancel()
         await self.analytics_pipeline.stop()
+        await self.autotuner.stop()
         await self.dev_tracker.stop_all()
         for t in self._tasks:
             t.cancel()

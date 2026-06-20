@@ -47,6 +47,7 @@ class Executor:
         dev_tracker: DevTracker,
         gas_optimizer: GasOptimizer,
         anti_sandwich: AntiSandwich,
+        alpha_signal=None,
     ) -> None:
         self.adapter = adapter
         self.risk = risk_manager
@@ -57,6 +58,7 @@ class Executor:
         self.dev_tracker = dev_tracker
         self.gas_opt = gas_optimizer
         self.anti_sandwich = anti_sandwich
+        self.alpha_signal = alpha_signal
         self.bonding = BondingCurveAnalyzer()
         self.cfg = Config.get()
         self.paper_mode = self.cfg["trading"]["mode"] == "paper"
@@ -142,6 +144,7 @@ class Executor:
             price = await self.adapter.get_price(signal.token_address) or 0.0001
             await self.risk.open_position(signal, size_base, price, size_base / max(price, 1e-9))
             await self._register_position_tracking(signal, size_base, price)
+            await self._record_buy_attribution(signal)
             return
 
         result: OrderResult = await self.adapter.buy(
@@ -154,6 +157,7 @@ class Executor:
                 result.executed_amount or 0.0,
             )
             await self._register_position_tracking(signal, size_base, result.executed_price or 0)
+            await self._record_buy_attribution(signal)
             await self.notifier.notify_trade_opened(
                 signal, size_base, result.executed_price or 0, result.tx_hash or ""
             )
@@ -204,6 +208,12 @@ class Executor:
                     result.executed_price or key_pos.entry_price, reason,
                 )
                 self._unregister_position_tracking(signal.chain, signal.token_address)
+                # Attribution: mark the trade_features row as closed.
+                if pnl is not None:
+                    self._record_close_attribution(
+                        signal.chain, signal.token_address,
+                        key_pos.opened_at, pnl,
+                    )
             else:
                 # Partial sell: reduce the position in the bookkeeping (was a no-op before)
                 pnl = await self.risk.reduce_position(
@@ -249,6 +259,47 @@ class Executor:
             self.dev_tracker.untrack(chain, token)
         except Exception:
             pass
+
+    async def _record_buy_attribution(self, signal: Signal) -> None:
+        """
+        Capture per-analyzer scores at buy time so the weekly AutoTuner can
+        correlate signal components with realized pnl. Best-effort + non-blocking.
+        """
+        try:
+            from utils.attribution import record_buy_features
+            component_scores: dict[str, float] = {}
+            # If an alpha_signal generator is wired, fetch its component scores.
+            # This is a fresh API call; we keep it best-effort (timeout-safe).
+            if self.alpha_signal is not None:
+                try:
+                    sig = await asyncio.wait_for(
+                        self.alpha_signal.generate(signal.token_address, signal.chain),
+                        timeout=2.0,
+                    )
+                    component_scores = dict(sig.component_scores)
+                    component_scores["alpha_score"] = sig.alpha_score
+                except asyncio.TimeoutError:
+                    log.debug("executor.attribution_alpha_timeout", token=signal.token_address)
+                except Exception as e:
+                    log.debug("executor.attribution_alpha_failed",
+                              token=signal.token_address, error=str(e))
+            record_buy_features(
+                chain=signal.chain, token=signal.token_address,
+                strategy=signal.strategy, component_scores=component_scores,
+            )
+        except Exception as e:
+            log.warning("executor.attribution_record_failed",
+                        token=signal.token_address, error=str(e))
+
+    def _record_close_attribution(self, chain: str, token: str,
+                                  entry_ts: float, pnl_pct: float) -> None:
+        """Mark the trade_features row as closed with the realized pnl."""
+        try:
+            from utils.attribution import record_close_features
+            record_close_features(chain, token, entry_ts, pnl_pct)
+        except Exception as e:
+            log.warning("executor.attribution_close_failed",
+                        token=token, error=str(e))
 
     # ------------------------------------------------------------------
     # Smart exit signal processing (called by orchestrator)

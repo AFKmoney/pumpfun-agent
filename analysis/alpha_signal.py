@@ -114,8 +114,28 @@ class AlphaSignalGenerator:
         self.bonding = bonding
         self.mev = mev_detector
         self._cache: dict[str, tuple[float, AlphaSignal]] = {}
+        # Active weights: start with the hand-tuned defaults, then overlay any
+        # learned weights from the DB (set by the weekly attribution job).
+        self.weights: dict[str, float] = dict(self.WEIGHTS)
+        self._refresh_weights_from_db()
 
-    async def generate(self, mint: str, chain: str = "solana") -> AlphaSignal:
+    def _refresh_weights_from_db(self) -> None:
+        """Overlay learned weights from the DB if present (weekly re-tuning)."""
+        try:
+            from utils.persistence import Persistence
+            learned = Persistence.get().load_alpha_weights()
+            if learned:
+                # Only overlay components we know; preserve sum normalization.
+                merged = dict(self.WEIGHTS)
+                for k, v in learned.items():
+                    if k in merged:
+                        merged[k] = float(v)
+                total = sum(merged.values())
+                if total > 0:
+                    self.weights = {k: v / total for k, v in merged.items()}
+                log.info("alpha_signal.weights_loaded", weights=self.weights)
+        except Exception as e:
+            log.warning("alpha_signal.weights_load_failed", error=str(e))
         # 90-second cache to avoid hammering APIs
         cached = self._cache.get(mint)
         if cached and time.time() - cached[0] < 90:
@@ -257,9 +277,9 @@ class AlphaSignalGenerator:
             components["mev_penalty"] = 80
         conviction_factors.append(1.0)
 
-        # ---- Composite ----
+        # ---- Composite (uses self.weights: learned overlay if present) ----
         alpha_score = sum(
-            components.get(k, 50) * w for k, w in self.WEIGHTS.items()
+            components.get(k, 50) * w for k, w in self.weights.items()
         )
         conviction = sum(conviction_factors) / len(conviction_factors) if conviction_factors else 0
 
