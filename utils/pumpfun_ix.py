@@ -40,9 +40,9 @@ from typing import Optional
 import base58
 
 PUMP_FUN_PROGRAM = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"
-# pump.fun "global" config account — a FIXED address (not a deterministic PDA
-# under a simple seed). Hardcoded from the on-chain program. Do NOT derive it.
-PUMP_FUN_GLOBAL = "4wTV1YmcTDw1ymTH1MVOzqTJxQSx9YdXAKjWFU6tE4FR"
+# pump.fun "global" config account — derived via PDA seed ["global"] against the
+# pump.fun program. Computed once at import and cached. This is the canonical
+# address (4wTV1YmiEkRvAtNtsSGPtUrqRYQMe5SKy2uB4Jjaxnjf).
 TOKEN_PROGRAM = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
 ASSOCIATED_TOKEN_PROGRAM = "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL"
 SYSTEM_PROGRAM = "11111111111111111111111111111111"
@@ -63,10 +63,26 @@ CREATE_DISCRIMINATOR = _discriminator("create")
 # ----------------------------------------------------------------------
 def derive_global_pda() -> str:
     """
-    pump.fun global config account. This is a FIXED address baked into the
-    program (not a simple single-seed PDA). Returned as a constant.
+    pump.fun global config account. Derived via PDA seed ["global"] against
+    the pump.fun program. Cached after first computation.
     """
-    return PUMP_FUN_GLOBAL
+    global _GLOBAL_PDA_CACHE
+    if _GLOBAL_PDA_CACHE is None:
+        from solders.pubkey import Pubkey
+        pda, _ = Pubkey.find_program_address([b"global"], Pubkey.from_string(PUMP_FUN_PROGRAM))
+        _GLOBAL_PDA_CACHE = str(pda)
+    return _GLOBAL_PDA_CACHE
+
+
+# Lazy-computed cache for the global PDA (avoids solders import at module load).
+_GLOBAL_PDA_CACHE: Optional[str] = None
+
+# Backwards-compat constant: callers that imported PUMP_FUN_GLOBAL get the
+# derived value via a module-level property-like accessor.
+def __getattr__(name):
+    if name == "PUMP_FUN_GLOBAL":
+        return derive_global_pda()
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 def derive_bonding_curve_pda(mint: str) -> str:
