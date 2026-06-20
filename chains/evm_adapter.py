@@ -80,17 +80,62 @@ class EVMAdapter(BaseChainAdapter):
 
     # ------------------------------------------------------------------
     # Buy / Sell: route via Uniswap V3 router (Base) or Uniswap V2 (Ethereum).
-    # For brevity, this shows the V3-style swap. In production, integrate
-    # the specific pump.fun-clone contract if applicable.
+    # amountOutMin is now computed via the Uniswap V3 Quoter before each swap,
+    # then reduced by the requested slippage. This protects against sandwich MEV
+    # (was 0 before -> guaranteed sandwich victim on Base/ETH).
     # ------------------------------------------------------------------
+    QUOTER_V3 = "0xb27308f9F90D607463bb33eA1BeBb41C27CE5AB6"  # same address on Base + Ethereum
+    ROUTER_V3 = {
+        "base": "0x2626664c2603336E57B271c5C0b26F421741e481",
+        "ethereum": "0xE592427A0AEce92De3Edee1F18E0157C05861564",
+    }
+    WETH = {
+        "base": "0x4200000000000000000000000000000000000006",
+        "ethereum": "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2",
+    }
+
+    async def _quote_exact_input_single(
+        self, token_in: str, token_out: str, amount_in: int, fee_bps: int = 3000,
+    ) -> Optional[int]:
+        """
+        Query the Uniswap V3 Quoter for the expected amountOut of a single-hop swap.
+        Returns the quoted amountOut (wei units), or None on failure.
+        fee_bps: pool fee in hundredths of a bip (3000 = 0.3% — the most common pool).
+        """
+        quoter_abi = [
+            {"inputs": [
+                {"name": "tokenIn", "type": "address"},
+                {"name": "tokenOut", "type": "address"},
+                {"name": "amountIn", "type": "uint256"},
+                {"name": "fee", "type": "uint24"},
+                {"name": "sqrtPriceLimitX96", "type": "uint160"},
+            ], "name": "quoteExactInputSingle",
+             "outputs": [{"name": "amountOut", "type": "uint256"}],
+             "stateMutability": "nonpayable", "type": "function"},
+        ]
+        try:
+            quoter = self._w3.eth.contract(
+                address=self._w3.to_checksum_address(self.QUOTER_V3), abi=quoter_abi,
+            )
+            amount_out = await quoter.functions.quoteExactInputSingle(
+                self._w3.to_checksum_address(token_in),
+                self._w3.to_checksum_address(token_out),
+                amount_in, fee_bps, 0,
+            ).call()
+            return int(amount_out)
+        except Exception as e:
+            log.warning("evm.quoter_call_failed", error=str(e),
+                        token_in=token_in, token_out=token_out)
+            return None
+
     async def buy(self, token_address: str, amount_eth: float, slippage_bps: int) -> OrderResult:
         if not self.wallet.has_wallet(self.chain_name):
             return OrderResult(False, None, None, None, f"{self.chain_name} wallet not initialized")
         try:
             acct = self.wallet.evm_accounts[self.chain_name]
             token_addr = self._w3.to_checksum_address(token_address)
-            WETH = self._w3.to_checksum_address("0x4200000000000000000000000000000000000006")  # Base WETH
-            router = self._w3.to_checksum_address("0x2626664c2603336E57B271c5C0b26F421741e481")  # Uniswap V3 router on Base
+            WETH = self._w3.to_checksum_address(self.WETH[self.chain_name])
+            router = self._w3.to_checksum_address(self.ROUTER_V3[self.chain_name])
 
             router_abi = [
                 {"inputs":[{"name":"recipient","type":"address"},
@@ -105,11 +150,22 @@ class EVMAdapter(BaseChainAdapter):
             ]
             contract = self._w3.eth.contract(address=router, abi=router_abi)
             amount_in_wei = self._w3.to_wei(amount_eth, "ether")
-            deadline_amount_out_min = 0  # in production: query the pool for expected out, apply slippage
+
+            # Query the Quoter for the expected output, then apply slippage.
+            # This is the MEV/sandwich protection (was 0 before).
+            quoted_out = await self._quote_exact_input_single(WETH, token_addr, amount_in_wei)
+            if quoted_out is not None and quoted_out > 0:
+                amount_out_min = int(quoted_out * (10_000 - slippage_bps) / 10_000)
+                expected_tokens = quoted_out
+            else:
+                # Quoter failed (e.g. pool not at fee=3000). Fail safe: refuse the
+                # trade rather than submit an unprotected tx. Caller can retry.
+                return OrderResult(False, None, None, None,
+                                   "Quoter failed; refusing unprotected swap (would amountOutMin=0)")
 
             nonce = await self._w3.eth.get_transaction_count(acct.address)
             tx = await contract.functions.exactInputSingle(
-                acct.address, WETH, token_addr, amount_in_wei, deadline_amount_out_min, 0
+                acct.address, WETH, token_addr, amount_in_wei, amount_out_min, 0
             ).build_transaction({
                 "from": acct.address,
                 "nonce": nonce,
@@ -120,8 +176,16 @@ class EVMAdapter(BaseChainAdapter):
             signed = acct.sign_transaction(tx)
             tx_hash = await self._w3.eth.send_raw_transaction(signed.rawTransaction)
             receipt = await self._w3.eth.wait_for_transaction_receipt(tx_hash)
-            log.info("evm.buy.executed", chain=self.chain_name, token=token_address, tx=receipt.transactionHash.hex())
-            return OrderResult(True, receipt.transactionHash.hex(), None, None)
+            if receipt.status != 1:
+                return OrderResult(False, receipt.transactionHash.hex(), None, None,
+                                   f"Buy tx reverted: {receipt.transactionHash.hex()}")
+            # executed_price = ETH in / tokens out (using the quote as the realized out)
+            tinfo = await self.get_token_info(token_address)
+            executed_amount = expected_tokens / (10 ** tinfo.decimals)
+            executed_price = amount_eth / executed_amount if executed_amount > 0 else 0
+            log.info("evm.buy.executed", chain=self.chain_name, token=token_address,
+                     tx=receipt.transactionHash.hex(), amount_out_min=amount_out_min)
+            return OrderResult(True, receipt.transactionHash.hex(), executed_price, executed_amount)
         except Exception as e:
             log.error("evm.buy.failed", chain=self.chain_name, token=token_address, error=str(e))
             return OrderResult(False, None, None, None, str(e))
@@ -141,20 +205,8 @@ class EVMAdapter(BaseChainAdapter):
         try:
             acct = self.wallet.evm_accounts[self.chain_name]
             token_addr = self._w3.to_checksum_address(token_address)
-            WETH = self._w3.to_checksum_address(
-                # Base WETH = 0x4200...0006, Ethereum WETH = 0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2
-                "0x4200000000000000000000000000000000000006"
-                if self.chain_name == "base"
-                else "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2"
-            )
-            router = self._w3.to_checksum_address(
-                # Uniswap V3 SwapRouter02
-                # Base: 0x2626664c2603336E57B271c5C0b26F421741e481
-                # Ethereum: 0xE592427A0AEce92De3Edee1F18E0157C05861564
-                "0x2626664c2603336E57B271c5C0b26F421741e481"
-                if self.chain_name == "base"
-                else "0xE592427A0AEce92De3Edee1F18E0157C05861564"
-            )
+            WETH = self._w3.to_checksum_address(self.WETH[self.chain_name])
+            router = self._w3.to_checksum_address(self.ROUTER_V3[self.chain_name])
 
             # ---- 1. Token decimals ----
             tinfo = await self.get_token_info(token_address)
@@ -205,10 +257,14 @@ class EVMAdapter(BaseChainAdapter):
                  "type":"function"}
             ]
             swap_contract = self._w3.eth.contract(address=router, abi=router_abi)
-            # amountOutMin: query expected output and apply slippage
-            # For simplicity we use 0 here and rely on slippage being checked off-chain.
-            # In production: query Quoter contract for expected out, then apply slippage_bps.
-            amount_out_min = 0  # TODO: use Quoter contract
+            # Query the Quoter for the expected WETH output, then apply slippage.
+            # MEV/sandwich protection (was 0 before -> guaranteed sandwich victim).
+            quoted_out = await self._quote_exact_input_single(token_addr, WETH, raw_amount)
+            if quoted_out is not None and quoted_out > 0:
+                amount_out_min = int(quoted_out * (10_000 - slippage_bps) / 10_000)
+            else:
+                return OrderResult(False, None, None, None,
+                                   "Quoter failed; refusing unprotected sell (would amountOutMin=0)")
 
             nonce = await self._w3.eth.get_transaction_count(acct.address)
             swap_tx = await swap_contract.functions.exactInputSingle(
