@@ -104,36 +104,68 @@ class Backtester:
     async def run_for_strategy(self, strategy: BaseStrategy,
                                sample_tokens: list[str]) -> BacktestResult:
         """
-        Run a backtest for a given strategy on a list of representative tokens.
-        Aggregates results across all tokens.
+        Run a backtest that calls the REAL strategy.evaluate() on historical
+        data — not a hardcoded SMA crossover. Aggregates results across tokens.
+
+        For each token, we replay the OHLCV series bar-by-bar, feeding the
+        strategy a synthetic event each bar with the price + RSI context it
+        expects. We honor the BUY/SELL signals the strategy actually emits,
+        and simulate trades with the strategy's own stop-loss / take-profit
+        (from the returned Signal), not a fixed 10/30%.
         """
         all_returns: list[float] = []
-        for token in sample_tokens[:5]:  # cap at 5 tokens to stay within rate limits
+        max_tokens = int(self.cfg.get("backtest_max_tokens", 5))
+        for token in sample_tokens[:max_tokens]:
             try:
                 prices = await self.fetch_ohlcv(token, interval="5m", limit=1000)
                 if len(prices) < 100:
                     continue
-                # Simple signal generation: buy when 5-bar SMA crosses above 20-bar SMA
-                sma5 = self._sma(prices, 5)
-                sma20 = self._sma(prices, 20)
-                signals = []
-                for i in range(20, len(prices) - 1):
-                    if sma5[i] > sma20[i] and sma5[i - 1] <= sma20[i - 1]:
-                        signals.append(i)
-                # Simulate trades
-                for entry_idx in signals:
-                    entry_price = prices[entry_idx]
-                    exit_price = entry_price
-                    for j in range(1, 60):
-                        if entry_idx + j >= len(prices):
-                            break
-                        p = prices[entry_idx + j]
-                        pnl = (p - entry_price) / entry_price
-                        if pnl <= -0.10 or pnl >= 0.30:
-                            exit_price = p
-                            break
-                        exit_price = p
-                    all_returns.append((exit_price - entry_price) / entry_price)
+                # Grid scalping has its own replay (no usable evaluate())
+                if getattr(strategy, "name", "") == "grid_scalping":
+                    all_returns.extend(self._simulate_grid(strategy, prices))
+                    continue
+                # Replay the series. We track one open position at a time per token
+                # (matching the risk manager's per-token single-position model).
+                entry_idx: Optional[int] = None
+                entry_price = 0.0
+                active_sl_pct = 0.10
+                active_tp_pct = 0.30
+                for i in range(30, len(prices) - 1):
+                    price = float(prices[i])
+                    # If we hold a position, check SL/TP/exit against current price
+                    if entry_idx is not None:
+                        pnl = (price - entry_price) / entry_price
+                        # Also let the strategy opine on an exit (e.g. momentum
+                        # SELL on RSI overbought). We feed it the bar context.
+                        exit_signal = await self._replay_evaluate(
+                            strategy, token, prices, i, price,
+                        )
+                        should_exit = (
+                            pnl <= -active_sl_pct
+                            or pnl >= active_tp_pct
+                            or (exit_signal is not None
+                                and exit_signal.signal_type == SignalType.SELL)
+                        )
+                        if should_exit:
+                            all_returns.append((price - entry_price) / entry_price)
+                            entry_idx = None
+                        continue
+                    # No open position: ask the strategy for a BUY
+                    buy_signal = await self._replay_evaluate(
+                        strategy, token, prices, i, price,
+                    )
+                    if buy_signal is not None and buy_signal.signal_type == SignalType.BUY:
+                        entry_idx = i
+                        entry_price = price
+                        # Honor the strategy's own SL/TP if provided
+                        if buy_signal.stop_loss_pct:
+                            active_sl_pct = buy_signal.stop_loss_pct / 100.0
+                        if buy_signal.take_profit_pct:
+                            active_tp_pct = buy_signal.take_profit_pct / 100.0
+                # Force-close any still-open position at the last available price
+                if entry_idx is not None:
+                    last_price = float(prices[-1])
+                    all_returns.append((last_price - entry_price) / entry_price)
             except Exception as e:
                 log.warning("backtester.token_failed", token=token, error=str(e))
 
@@ -153,6 +185,107 @@ class Backtester:
             total_return_pct=total_ret, num_trades=arr.size,
             max_drawdown_pct=max_dd,
         )
+
+    async def _replay_evaluate(
+        self, strategy: BaseStrategy, token: str, prices: np.ndarray,
+        bar_idx: int, price: float,
+    ) -> Optional[Signal]:
+        """
+        Build the synthetic event the strategy's evaluate() expects from a
+        historical bar, and call it. Each strategy consumes a different event
+        shape, so we dispatch on strategy.name.
+
+        Grid scalping is handled separately (it has no usable evaluate(); see
+        _simulate_grid below).
+
+        Returns the Signal (BUY/SELL/HOLD/None) the strategy emits, or None if
+        the strategy has no replay-compatible evaluate().
+        """
+        name = getattr(strategy, "name", "")
+        try:
+            if name == "momentum":
+                # Momentum expects {token, chain, vol5m, change5m, rsi}
+                window = prices[max(0, bar_idx - 14): bar_idx + 1]
+                rsi = self._rsi(list(window)) if len(window) >= 15 else None
+                change5m = (
+                    (price - float(prices[bar_idx - 12])) / float(prices[bar_idx - 12]) * 100
+                    if bar_idx >= 13 else 0.0
+                )
+                event = {
+                    "token": token, "chain": "solana",
+                    "vol5m": 0.0, "change5m": change5m, "rsi": rsi,
+                }
+                return await strategy.evaluate(event)
+            elif name in ("sniping", "copy_trade", "grid_scalping"):
+                # These either need on-chain launch events that can't be
+                # reconstructed from OHLCV (sniping/copy), or have no usable
+                # evaluate() (grid uses _tick). grid is handled by
+                # _simulate_grid() in the caller. Skip here.
+                return None
+            else:
+                # Unknown strategy: try a generic price event
+                event = {"token": token, "chain": "solana", "price": price}
+                try:
+                    return await strategy.evaluate(event)
+                except Exception:
+                    return None
+        except Exception as e:
+            log.debug("backtester.replay_evaluate_failed",
+                      strategy=name, token=token, error=str(e))
+            return None
+
+    def _simulate_grid(self, strategy: BaseStrategy, prices: np.ndarray) -> list[float]:
+        """
+        Replay the grid-scalping strategy on a historical price series.
+        Replicates the production logic: build a grid around the initial price,
+        emit BUY when price drops to a buy level, SELL when it rises to a sell
+        level. Returns the list of per-trade returns.
+        """
+        levels = int(getattr(strategy, "levels", 8))
+        spacing_pct = float(getattr(strategy, "spacing_pct", 1.5))
+        if len(prices) < 30:
+            return []
+        mid = float(prices[0])
+        # Build buy/sell levels
+        buy_levels = [mid * (1 - (spacing_pct / 100) * i) for i in range(1, levels + 1)]
+        sell_levels = [mid * (1 + (spacing_pct / 100) * i) for i in range(1, levels + 1)]
+        buy_filled = [False] * levels
+        returns: list[float] = []
+        open_buys: list[float] = []  # entry prices of currently-held grid tranches
+        for p in prices[1:]:
+            # Process sells first (realize gains on existing positions)
+            for si, sp in enumerate(sell_levels):
+                if p >= sp and any(entry < sp for entry in open_buys):
+                    # Sell the cheapest eligible tranche at this sell level
+                    entry = min(e for e in open_buys if e < sp)
+                    open_buys.remove(entry)
+                    returns.append((sp - entry) / entry)
+            # Process buys
+            for bi, bp in enumerate(buy_levels):
+                if p <= bp and not buy_filled[bi]:
+                    buy_filled[bi] = True
+                    open_buys.append(bp)
+        # Force-close remaining at the last price
+        last = float(prices[-1])
+        for entry in open_buys:
+            returns.append((last - entry) / entry)
+        return returns
+
+    @staticmethod
+    def _rsi(prices: list[float], period: int = 14) -> Optional[float]:
+        if len(prices) < period + 1:
+            return None
+        gains, losses = 0.0, 0.0
+        for i in range(-period, 0):
+            diff = prices[i] - prices[i - 1]
+            if diff > 0:
+                gains += diff
+            else:
+                losses -= diff
+        if losses == 0:
+            return 100.0
+        rs = (gains / period) / (losses / period)
+        return 100.0 - (100.0 / (1.0 + rs))
 
     @staticmethod
     def _sma(prices: np.ndarray, window: int) -> np.ndarray:

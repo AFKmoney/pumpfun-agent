@@ -136,6 +136,8 @@ class AlphaSignalGenerator:
                 log.info("alpha_signal.weights_loaded", weights=self.weights)
         except Exception as e:
             log.warning("alpha_signal.weights_load_failed", error=str(e))
+
+    async def generate(self, mint: str, chain: str = "solana") -> AlphaSignal:
         # 90-second cache to avoid hammering APIs
         cached = self._cache.get(mint)
         if cached and time.time() - cached[0] < 90:

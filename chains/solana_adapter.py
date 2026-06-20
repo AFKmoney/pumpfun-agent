@@ -120,7 +120,6 @@ class SolanaAdapter(BaseChainAdapter):
         bc_state = None
         try:
             bc_state = await self._bonding.fetch_state(token_address)
-            use_direct = bc_state is not None and not bc_state.complete if bc_state else False
             if bc_state is not None:
                 use_direct = bc_state.completion_pct < 100.0
         except Exception as e:
