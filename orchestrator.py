@@ -40,6 +40,7 @@ from strategies.momentum import MomentumStrategy
 from strategies.sniping import SnipingStrategy
 from analysis.alpha_signal import AlphaSignalGenerator
 from analysis.crowd_engine import CrowdPositioningEngine, ContrarianAgent
+from analysis.crowd_weight_router import CrowdWeightRouter
 from analysis.dev_forensics import DevForensics
 from analysis.lifecycle import LifecycleAnalyzer
 from analysis.liquidity_depth import LiquidityDepthAnalyzer
@@ -103,6 +104,9 @@ class Orchestrator:
         self.lifecycle = LifecycleAnalyzer()
         self.liquidity_depth = LiquidityDepthAnalyzer()
         self.sentiment = SentimentAnalyzer()
+        # Crowd weight router: deflates trend-following signal weights when the
+        # crowd is at an extreme (so the swarm doesn't follow the herd).
+        self.crowd_router = CrowdWeightRouter()
         self.alpha_signal = AlphaSignalGenerator(
             token_scorer=self.token_scorer,
             order_flow=self.order_flow,
@@ -112,6 +116,7 @@ class Orchestrator:
             sentiment=self.sentiment,
             bonding=self.bonding,
             mev_detector=self.mev_detector,
+            crowd_router=self.crowd_router,
         )
 
         # Live data ingestion pipeline that feeds the analyzers (order_flow,
@@ -563,6 +568,11 @@ class Orchestrator:
                 for mint in mints:
                     try:
                         event = await self.crowd_engine.assess(mint)
+                        # Apply crowd-driven weight dampening to AlphaSignal so
+                        # trend-following components don't fight the contrarian view.
+                        self.crowd_router.apply(
+                            mint, event.crowd_score, event.conviction,
+                        )
                         if abs(event.crowd_score) >= 0.5 and event.conviction >= 0.4:
                             signals = self.contrarian.on_positioning(event)
                             for sig in signals:

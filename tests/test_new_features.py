@@ -726,3 +726,54 @@ class TestContrarianAgent:
         assert tp >= 20.0          # ~20% (2000bps)
         assert sl < tp             # SL always smaller than TP (asymmetric)
         assert sl >= 5.0           # SL never below the 5% floor
+
+
+# =====================================================================
+# crowd_weight_router: dynamic weight dampening on crowd extremes
+# =====================================================================
+class TestCrowdWeightRouter:
+    """Router logic inlined (the module-level setup_logger triggers Config)."""
+    TREND_COMPS = {"order_flow", "lifecycle", "sentiment"}
+    FLOOR = 0.15
+
+    @staticmethod
+    def _strength(crowd_score, conviction):
+        return min(1.0, abs(crowd_score) * conviction)
+
+    @staticmethod
+    def _multipliers(crowd_score, conviction):
+        s = TestCrowdWeightRouter._strength(crowd_score, conviction)
+        if s < 0.15:
+            return {}
+        out = {}
+        for c in TestCrowdWeightRouter.TREND_COMPS:
+            out[c] = max(TestCrowdWeightRouter.FLOOR, 1.0 - s * (1.0 - TestCrowdWeightRouter.FLOOR))
+        return out
+
+    def test_no_dampening_when_weak(self):
+        assert self._multipliers(0.3, 0.3) == {}
+
+    def test_dampens_trend_on_strong_extreme(self):
+        m = self._multipliers(0.8, 0.9)
+        assert m["order_flow"] < 0.5
+        assert m["lifecycle"] < 0.5
+        assert m["sentiment"] < 0.5
+        assert m["order_flow"] >= 0.15  # floor
+
+    def test_floor_never_below_015(self):
+        # Even at max strength, trend components stay >= floor
+        m = self._multipliers(1.0, 1.0)
+        for v in m.values():
+            assert v >= 0.15
+
+    def test_renormalization_preserves_sum_and_shifts_weight(self):
+        m = self._multipliers(0.8, 0.9)
+        base = {"order_flow": 0.30, "smart_money": 0.20, "token_quality": 0.15,
+                "lifecycle": 0.12, "liquidity": 0.10, "sentiment": 0.08,
+                "bonding_curve": 0.03, "mev_penalty": 0.02}
+        eff = {k: w * m.get(k, 1.0) for k, w in base.items()}
+        total = sum(eff.values())
+        norm = {k: v / total for k, v in eff.items()}
+        assert abs(sum(norm.values()) - 1.0) < 1e-9
+        assert norm["order_flow"] < base["order_flow"]      # dampened down
+        assert norm["mev_penalty"] > base["mev_penalty"]    # relatively up

@@ -103,6 +103,7 @@ class AlphaSignalGenerator:
         sentiment: SentimentAnalyzer,
         bonding: BondingCurveAnalyzer,
         mev_detector: MevDetector,
+        crowd_router=None,
     ) -> None:
         self.cfg = Config.get()
         self.scorer = token_scorer
@@ -113,6 +114,7 @@ class AlphaSignalGenerator:
         self.sentiment = sentiment
         self.bonding = bonding
         self.mev = mev_detector
+        self.crowd_router = crowd_router
         self._cache: dict[str, tuple[float, AlphaSignal]] = {}
         # Active weights: start with the hand-tuned defaults, then overlay any
         # learned weights from the DB (set by the weekly attribution job).
@@ -280,8 +282,22 @@ class AlphaSignalGenerator:
         conviction_factors.append(1.0)
 
         # ---- Composite (uses self.weights: learned overlay if present) ----
+        # Apply crowd-driven dampening if a router is wired and this token is
+        # under an active crowd extreme. Trend-following components get deflated
+        # so the bot doesn't follow the crowd into the trap.
+        effective_weights = self.weights
+        if self.crowd_router is not None:
+            multipliers = self.crowd_router.active_multipliers(mint)
+            if multipliers:
+                effective_weights = {
+                    k: w * multipliers.get(k, 1.0) for k, w in self.weights.items()
+                }
+                # Renormalize so the dampened weights still sum to 1.0
+                total = sum(effective_weights.values())
+                if total > 0:
+                    effective_weights = {k: v / total for k, v in effective_weights.items()}
         alpha_score = sum(
-            components.get(k, 50) * w for k, w in self.weights.items()
+            components.get(k, 50) * w for k, w in effective_weights.items()
         )
         conviction = sum(conviction_factors) / len(conviction_factors) if conviction_factors else 0
 
