@@ -39,10 +39,13 @@ from strategies.grid_scalping import GridScalpingStrategy
 from strategies.momentum import MomentumStrategy
 from strategies.sniping import SnipingStrategy
 from analysis.alpha_signal import AlphaSignalGenerator
+from analysis.dev_forensics import DevForensics
 from analysis.lifecycle import LifecycleAnalyzer
 from analysis.liquidity_depth import LiquidityDepthAnalyzer
 from analysis.mev_detector import MevDetector
 from analysis.order_flow import OrderFlowAnalyzer
+from analysis.peak_hype import PeakHypeDetector
+from analysis.regime import RegimeDetector
 from analysis.sentiment import SentimentAnalyzer
 from analysis.social_graph import SocialGraphAnalyzer
 from analysis.soft_rug import SoftRugDetector
@@ -129,6 +132,17 @@ class Orchestrator:
         # Soft-rug early-warning model (exits before a gradual dump completes).
         self.soft_rug = SoftRugDetector()
 
+        # Market regime detector (auto-throttle trading in risk-off conditions).
+        self.regime = RegimeDetector()
+
+        # Dev wallet forensics (detect serial ruggers from launch history).
+        self.dev_forensics = DevForensics(bonding=self.bonding)
+
+        # Peak-hype contrarian exit (sell into blowoff tops).
+        self.peak_hype = PeakHypeDetector(
+            order_flow=self.order_flow, sentiment=self.sentiment,
+        )
+
         self._tasks: list[asyncio.Task] = []
         self._stop_event = asyncio.Event()
         self.state = "INIT"
@@ -175,6 +189,8 @@ class Orchestrator:
                 anti_sandwich=self.anti_sandwich,
                 alpha_signal=self.alpha_signal,
                 soft_rug=self.soft_rug,
+                regime=self.regime,
+                dev_forensics=self.dev_forensics,
             )
 
         # Register migration detector callback -> notify + extend hold time
@@ -241,8 +257,12 @@ class Orchestrator:
         await self.autotuner.start()
         # Start the nightly soft-rug model retrain.
         await self.soft_rug.start_nightly_retrain()
+        # Start the regime detector (auto-throttle in risk-off markets).
+        await self.regime.start()
         # Start the soft-rug position monitor (exits high-risk positions early).
         self._tasks.append(asyncio.create_task(self._soft_rug_monitor()))
+        # Start the peak-hype contrarian exit monitor (sell into blowoff tops).
+        self._tasks.append(asyncio.create_task(self._peak_hype_monitor()))
 
         self.state = "RUNNING"
         log.info("orchestrator.running",
@@ -468,6 +488,48 @@ class Orchestrator:
                 log.error("orchestrator.soft_rug_monitor_error", error=str(e))
             await asyncio.sleep(interval)
 
+    async def _peak_hype_monitor(self) -> None:
+        """
+        Periodically check open positions for blowoff-top conditions. If the
+        peak-hype detector fires, emit a SELL to capture gains before the
+        reversal. Runs every 60s (hype shifts on minute timescales).
+        """
+        interval = 60
+        # Track the price 1h ago per token (for the price_extension signal).
+        price_history: dict[str, list[tuple[float, float]]] = {}
+        while not self._stop_event.is_set():
+            try:
+                for key, pos in list(self.risk.positions.items()):
+                    if pos.chain != "solana":
+                        continue
+                    try:
+                        price = await self.adapters["solana"].get_price(pos.token)
+                        if price <= 0:
+                            continue
+                        now = time.time()
+                        hist = price_history.setdefault(pos.token, [])
+                        hist.append((now, price))
+                        hist[:] = [(t, p) for t, p in hist if now - t < 3700]
+                        price_1h_ago = next((p for t, p in reversed(hist) if now - t >= 3500), price)
+                        signal = self.peak_hype.assess(pos.token, price, price_1h_ago)
+                        if signal.is_peak:
+                            log.warning("orchestrator.peak_hype_exit",
+                                        token=pos.token, reason=signal.reason)
+                            await self.notifier.notify_error(
+                                f"🔥 PEAK HYPE EXIT\nToken: {pos.token}\n{signal.reason}"
+                            )
+                            await self.signal_queue.put(Signal(
+                                strategy="peak_hype", chain=pos.chain, token_address=pos.token,
+                                signal_type=SignalType.SELL, suggested_size_pct=1.0,
+                                confidence=0.8, reason=f"PEAK HYPE: {signal.reason}",
+                            ))
+                    except Exception as e:
+                        log.debug("orchestrator.peak_hype_check_error",
+                                  token=pos.token, error=str(e))
+            except Exception as e:
+                log.error("orchestrator.peak_hype_monitor_error", error=str(e))
+            await asyncio.sleep(interval)
+
     # ------------------------------------------------------------------
     async def _shutdown(self) -> None:
         log.info("orchestrator.shutdown_starting")
@@ -477,6 +539,7 @@ class Orchestrator:
         await self.analytics_pipeline.stop()
         await self.autotuner.stop()
         await self.soft_rug.stop()
+        await self.regime.stop()
         await self.dev_tracker.stop_all()
         for t in self._tasks:
             t.cancel()

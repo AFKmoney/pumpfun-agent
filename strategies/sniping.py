@@ -22,6 +22,7 @@ import time
 from chains.base_chain import BaseChainAdapter
 from strategies.base_strategy import BaseStrategy, Signal, SignalType
 from utils.config_loader import Config
+from utils.latency_tracer import get_tracer
 from utils.logger import setup_logger
 from utils.pumpfun_parser import PUMP_FUN_PROGRAM, fetch_create_event_from_signature
 
@@ -43,20 +44,21 @@ class SnipingStrategy(BaseStrategy):
 
     async def run(self) -> None:
         log.info("sniping.started", chain=self.adapter.chain_name, program=PUMP_FUN_PROGRAM)
+        tracer = get_tracer()
         try:
             async for event in self.adapter.watch_new_tokens():
-                t0 = time.monotonic()
-                sig = await self.evaluate(event)
+                trace_id = tracer.start("snipe", token=event.get("mint", ""))
+                sig = await self.evaluate(event, trace_id=trace_id)
                 if sig and sig.signal_type == SignalType.BUY:
                     await self.queue.put(sig)
-                    log.info("sniping.signal_emitted",
-                             chain=sig.chain, token=sig.token_address,
-                             elapsed_ms=int((time.monotonic() - t0) * 1000))
+                    tracer.mark(trace_id, "signal_emitted")
+                else:
+                    tracer.finish(trace_id)  # no signal -> close the trace
         except asyncio.CancelledError:
             log.info("sniping.cancelled")
             raise
 
-    async def evaluate(self, event: dict) -> Signal | None:
+    async def evaluate(self, event: dict, trace_id: int | None = None) -> Signal | None:
         chain = event.get("chain", self.adapter.chain_name)
         signature = event.get("signature")
         if not signature:
@@ -82,6 +84,9 @@ class SnipingStrategy(BaseStrategy):
             dev_wallet = dev_wallet or create_event.user
             symbol = create_event.symbol
             name = create_event.name
+        if trace_id is not None:
+            from utils.latency_tracer import get_tracer
+            get_tracer().mark(trace_id, "parsed")
 
         log.info("sniping.new_launch_detected",
                  mint=mint, symbol=symbol or "?", name=(name or "?")[:40],
@@ -97,6 +102,9 @@ class SnipingStrategy(BaseStrategy):
             except Exception as e:
                 log.warning("sniping.anti_rug_check_failed", mint=mint, error=str(e))
                 return None
+        if trace_id is not None:
+            from utils.latency_tracer import get_tracer
+            get_tracer().mark(trace_id, "scored")
 
         # 3. Emit BUY signal carrying the dev wallet for the executor's DevTracker
         return Signal(
@@ -114,5 +122,6 @@ class SnipingStrategy(BaseStrategy):
                 "bonding_curve": bonding_curve,
                 "token_symbol": symbol,
                 "token_name": name,
+                "trace_id": trace_id,
             },
         )

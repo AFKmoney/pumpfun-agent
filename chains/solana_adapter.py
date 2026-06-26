@@ -111,7 +111,8 @@ class SolanaAdapter(BaseChainAdapter):
     # Routing: tokens still on the bonding curve -> pump.fun direct ix (fast).
     #          tokens migrated to Raydium -> Jupiter aggregator.
     # ------------------------------------------------------------------
-    async def buy(self, token_address: str, amount_sol: float, slippage_bps: int) -> OrderResult:
+    async def buy(self, token_address: str, amount_sol: float, slippage_bps: int,
+                  trace_id: int | None = None) -> OrderResult:
         if not self.wallet.has_wallet("solana"):
             return OrderResult(False, None, None, None, "Solana wallet not initialized")
 
@@ -126,7 +127,7 @@ class SolanaAdapter(BaseChainAdapter):
             log.warning("solana.buy.bc_check_failed", token=token_address, error=str(e))
 
         if use_direct:
-            result = await self._buy_pumpfun_direct(token_address, amount_sol, slippage_bps, bc_state)
+            result = await self._buy_pumpfun_direct(token_address, amount_sol, slippage_bps, bc_state, trace_id=trace_id)
             if result.success:
                 return result
             # Fall through to Jupiter if direct path fails (token may have just migrated)
@@ -137,7 +138,7 @@ class SolanaAdapter(BaseChainAdapter):
 
     async def _buy_pumpfun_direct(
         self, token_address: str, amount_sol: float, slippage_bps: int,
-        bc_state: Optional[object] = None,
+        bc_state: Optional[object] = None, trace_id: int | None = None,
     ) -> OrderResult:
         """
         Build a pump.fun `buy` instruction directly and submit it.
@@ -194,6 +195,9 @@ class SolanaAdapter(BaseChainAdapter):
                 signed = VersionedTransaction(msg, [kp])
             finally:
                 await client.close()
+            if trace_id is not None:
+                from utils.latency_tracer import get_tracer
+                get_tracer().mark(trace_id, "built")
 
             # Optional Jito bundle (tip + buy in single v0 tx via tip ix appended)
             jito = JitoClient()
@@ -214,10 +218,17 @@ class SolanaAdapter(BaseChainAdapter):
                 finally:
                     await client.close()
                 tx_b64 = base64.b64encode(bytes(signed)).decode("ascii")
+                if trace_id is not None:
+                    from utils.latency_tracer import get_tracer
+                    get_tracer().mark(trace_id, "submitted")
                 bundle_uuid = await jito.submit_bundle([tx_b64])
                 if bundle_uuid:
                     status = await jito.wait_for_landing(bundle_uuid, timeout_sec=15.0)
                     if status == "Landed":
+                        if trace_id is not None:
+                            from utils.latency_tracer import get_tracer
+                            get_tracer().mark(trace_id, "confirmed")
+                            get_tracer().finish(trace_id)
                         log.info("solana.buy.pumpfun_jito_landed", token=token_address,
                                  bundle=bundle_uuid, tokens_out=tokens_out,
                                  max_sol_cost=max_sol_cost / 1e9)
@@ -230,11 +241,18 @@ class SolanaAdapter(BaseChainAdapter):
             # Normal RPC submission
             client = AsyncClient(self.endpoints[0])
             try:
+                if trace_id is not None:
+                    from utils.latency_tracer import get_tracer
+                    get_tracer().mark(trace_id, "submitted")
                 sig = await client.send_raw_transaction(
                     bytes(signed),
                     opts=TxOpts(skip_preflight=False, max_retries=3),
                 )
                 await client.confirm_transaction(sig.value, commitment="confirmed")
+                if trace_id is not None:
+                    from utils.latency_tracer import get_tracer
+                    get_tracer().mark(trace_id, "confirmed")
+                    get_tracer().finish(trace_id)
                 executed_price = amount_sol / tokens_out if tokens_out > 0 else 0
                 log.info("solana.buy.pumpfun_executed", token=token_address,
                          sig=str(sig.value), tokens_out=tokens_out,

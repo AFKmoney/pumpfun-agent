@@ -49,6 +49,8 @@ class Executor:
         anti_sandwich: AntiSandwich,
         alpha_signal=None,
         soft_rug=None,
+        regime=None,
+        dev_forensics=None,
     ) -> None:
         self.adapter = adapter
         self.risk = risk_manager
@@ -61,6 +63,8 @@ class Executor:
         self.anti_sandwich = anti_sandwich
         self.alpha_signal = alpha_signal
         self.soft_rug = soft_rug
+        self.regime = regime
+        self.dev_forensics = dev_forensics
         self.bonding = BondingCurveAnalyzer()
         self.cfg = Config.get()
         self.paper_mode = self.cfg["trading"]["mode"] == "paper"
@@ -88,6 +92,12 @@ class Executor:
     # ------------------------------------------------------------------
     async def _handle_buy(self, signal: Signal, size_base: float) -> None:
         meta = signal.metadata or {}
+        # 0. Regime gate: refuse new buys in risk-off markets (Edge #5).
+        if self.regime is not None and signal.signal_type == SignalType.BUY:
+            if not self.regime.should_trade():
+                log.info("executor.regime_blocked", token=signal.token_address,
+                         label=self.regime.current.label if self.regime.current else "unknown")
+                return
         # 1. Anti-rugpull gate (sniping skips the slow honeypot micro-buy)
         skip_honeypot = (signal.strategy == "sniping")
         verdict = await self.anti_rug.check(signal.token_address, skip_honeypot=skip_honeypot)
@@ -95,6 +105,24 @@ class Executor:
             await self.notifier.notify_rugpull(signal.token_address, verdict.reasons)
             log.warning("executor.rugpull_blocked", token=signal.token_address, reasons=verdict.reasons)
             return
+
+        # 1b. Dev wallet forensics gate (Edge #2): refuse buys from serial ruggers.
+        dev_wallet = meta.get("dev_wallet")
+        if self.dev_forensics is not None and dev_wallet:
+            try:
+                rep = await self.dev_forensics.assess(dev_wallet)
+                if rep and rep.is_serial_rugger:
+                    await self.notifier.notify_error(
+                        f"🚫 SERIAL RUGGER BLOCKED\nDev: {dev_wallet[:8]}...\n"
+                        f"Rug score: {rep.rug_score:.0%} ({rep.rug_count}/{rep.total_created} launches rugged)"
+                    )
+                    log.warning("executor.serial_rugger_blocked", token=signal.token_address,
+                                dev=dev_wallet[:8], rug_score=rep.rug_score,
+                                created=rep.total_created, rugs=rep.rug_count)
+                    return
+            except Exception as e:
+                log.warning("executor.dev_forensics_failed",
+                            token=signal.token_address, error=str(e))
 
         # 2. Token scoring (skip for pyramiding on existing positions, those are already vetted)
         key = f"{signal.chain}:{signal.token_address}"
@@ -150,7 +178,8 @@ class Executor:
             return
 
         result: OrderResult = await self.adapter.buy(
-            signal.token_address, size_base, slip_rec.slippage_bps
+            signal.token_address, size_base, slip_rec.slippage_bps,
+            trace_id=meta.get("trace_id"),
         )
         if result.success:
             await self.risk.open_position(

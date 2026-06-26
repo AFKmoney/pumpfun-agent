@@ -128,7 +128,8 @@ class EVMAdapter(BaseChainAdapter):
                         token_in=token_in, token_out=token_out)
             return None
 
-    async def buy(self, token_address: str, amount_eth: float, slippage_bps: int) -> OrderResult:
+    async def buy(self, token_address: str, amount_eth: float, slippage_bps: int,
+                  trace_id: int | None = None) -> OrderResult:
         if not self.wallet.has_wallet(self.chain_name):
             return OrderResult(False, None, None, None, f"{self.chain_name} wallet not initialized")
         try:

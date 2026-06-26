@@ -536,3 +536,79 @@ class TestAlphaSignalGenerate:
                           "self.lifecycle.assess"):
             assert forbidden not in body, \
                 f"_refresh_weights_from_db leaked generate() code: {forbidden!r}"
+
+
+# =====================================================================
+# regime: trend normalization + volatility (pure logic, inlined to avoid
+# importing analysis.regime which pulls in Config at __init__ time)
+# =====================================================================
+class TestRegime:
+    @staticmethod
+    def _trend_to_unit(change_pct):
+        return max(0.0, min(1.0, 0.5 + change_pct / 20.0))
+
+    @staticmethod
+    def _volatility(history):
+        import math
+        if len(history) < 3:
+            return 0.0
+        prices = [p for _, p in history if p > 0]
+        if len(prices) < 3:
+            return 0.0
+        rets = [math.log(prices[i] / prices[i-1]) for i in range(1, len(prices)) if prices[i-1] > 0]
+        if len(rets) < 2:
+            return 0.0
+        mean = sum(rets) / len(rets)
+        var = sum((r - mean) ** 2 for r in rets) / len(rets)
+        return math.sqrt(var)
+
+    def test_trend_to_unit_maps_correctly(self):
+        # -10% -> 0, 0% -> 0.5, +10% -> 1
+        assert abs(self._trend_to_unit(-10) - 0.0) < 1e-9
+        assert abs(self._trend_to_unit(0) - 0.5) < 1e-9
+        assert abs(self._trend_to_unit(10) - 1.0) < 1e-9
+        assert self._trend_to_unit(-20) == 0.0
+        assert self._trend_to_unit(20) == 1.0
+
+    def test_volatility_flat_is_zero(self):
+        flat = [(0.0, 100.0), (1.0, 100.0), (2.0, 100.0), (3.0, 100.0)]
+        assert self._volatility(flat) == 0.0
+
+    def test_volatility_volatile_is_positive(self):
+        import numpy as np
+        np.random.seed(3)
+        prices = 100 + np.cumsum(np.random.normal(0, 2, 50))
+        assert self._volatility(list(enumerate(prices.tolist()))) > 0
+
+
+# =====================================================================
+# peak_hype: detection logic (3-condition AND, inlined)
+# =====================================================================
+class TestPeakHype:
+    @staticmethod
+    def _assess(mention_ratio, bs_decline, price_ext,
+                vel_mult=3.0, bs_thresh=0.6, price_mult=2.0):
+        return (
+            mention_ratio >= vel_mult
+            and bs_decline <= bs_thresh
+            and price_ext >= price_mult
+        )
+
+    def test_not_peak_when_mentions_low(self):
+        # Price 3x extended but mentions only 1.5x -> not peak
+        assert not self._assess(mention_ratio=1.5, bs_decline=0.3, price_ext=3.0)
+
+    def test_not_peak_when_bs_still_rising(self):
+        # Mentions parabolic + price extended but buyers still dominant -> not peak
+        assert not self._assess(mention_ratio=5.0, bs_decline=0.9, price_ext=3.0)
+
+    def test_not_peak_when_price_not_extended(self):
+        # Mentions + bs decline but price flat -> not a blowoff, just noise
+        assert not self._assess(mention_ratio=5.0, bs_decline=0.3, price_ext=1.2)
+
+    def test_peak_when_all_three_conditions_met(self):
+        assert self._assess(mention_ratio=5.0, bs_decline=0.25, price_ext=3.0)
+
+    def test_boundary_at_thresholds(self):
+        # Exactly at thresholds -> peak (>=, <=)
+        assert self._assess(mention_ratio=3.0, bs_decline=0.6, price_ext=2.0)
