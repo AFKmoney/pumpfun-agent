@@ -612,3 +612,117 @@ class TestPeakHype:
     def test_boundary_at_thresholds(self):
         # Exactly at thresholds -> peak (>=, <=)
         assert self._assess(mention_ratio=3.0, bs_decline=0.6, price_ext=2.0)
+
+
+# =====================================================================
+# crowd_engine: signal scorers + fusion + contrarian agent
+# =====================================================================
+class TestCrowdEngine:
+    @staticmethod
+    def _score_order_flow(bs_ratio, total_trades=100, buy=None, sell=None):
+        """Inline of CrowdPositioningEngine._score_order_flow."""
+        if total_trades < 5:
+            return 0.0
+        if sell == 0:
+            return 1.0 if (buy or 0) > 0 else 0.0
+        import math
+        BUY_SELL_EXTREME = 3.0
+        return max(-1.0, min(1.0, math.tanh((bs_ratio - 1.0) / (BUY_SELL_EXTREME - 1.0))))
+
+    def test_order_flow_score_extremes(self):
+        # bs_ratio 1.0 (balanced) -> ~0
+        assert abs(self._score_order_flow(1.0)) < 0.05
+        # bs_ratio 5.0 (crowd all-in long) -> high positive (tanh saturates)
+        assert self._score_order_flow(5.0) > 0.8
+        # bs_ratio 0.1 (sell-heavy) -> clearly negative
+        assert self._score_order_flow(0.1) < -0.3
+        # Symmetry: ratio r and 1/r should produce opposite-sign scores
+        assert self._score_order_flow(0.2) < 0 < self._score_order_flow(5.0)
+
+    @staticmethod
+    def _score_bonding_curve(completion_pct):
+        """Inline of _score_bonding_curve."""
+        if completion_pct < 50:
+            return 0.0
+        return max(0.0, min(1.0, (completion_pct - 50.0) / 50.0))
+
+    def test_bonding_curve_score(self):
+        assert self._score_bonding_curve(30) == 0.0   # too early
+        assert self._score_bonding_curve(50) == 0.0   # neutral
+        assert abs(self._score_bonding_curve(75) - 0.5) < 1e-9
+        assert self._score_bonding_curve(100) == 1.0  # max sell-the-news risk
+
+    @staticmethod
+    def _conviction(raw_scores):
+        """Inline of the conviction calc. Filters to active signals (|v|>0.15)
+        then computes agreement-weighted mean magnitude."""
+        active = [v for v in raw_scores if abs(v) > 0.15]
+        if not active:
+            return 0.0
+        mean_abs = sum(abs(v) for v in active) / len(active)
+        signs = set(1 if v > 0 else -1 for v in active)
+        agreement = 1.0 if len(signs) == 1 else (0.4 if len(active) <= 2 else 0.2)
+        return min(1.0, mean_abs * agreement)
+
+    def test_conviction_high_when_all_agree(self):
+        # All positive + strong -> high conviction
+        assert self._conviction([0.8, 0.7, 0.6]) > 0.6
+
+    def test_conviction_low_when_divergent(self):
+        # Mixed signs -> low conviction (weak setup)
+        assert self._conviction([0.8, -0.3, 0.6]) < 0.4
+
+    def test_conviction_zero_when_all_neutral(self):
+        # All near-zero -> no active signals -> 0
+        assert self._conviction([0.05, 0.1, 0.02]) == 0.0
+
+
+class TestContrarianAgent:
+    """ContrarianAgent logic inlined (avoid importing crowd_engine which
+    pulls Config/structlog at import time)."""
+    EXTREME = 0.5
+
+    @staticmethod
+    def _on_positioning(crowd_score, conviction, regime_hint, expected_move_bps):
+        from strategies.base_strategy import Signal, SignalType
+        if abs(crowd_score) < 0.5:
+            return []
+        if crowd_score > 0:
+            sig_type = SignalType.SELL
+            suggested = 1.0
+            reason = f"Fade crowd {regime_hint}"
+        else:
+            sig_type = SignalType.BUY
+            suggested = min(0.02, conviction * 0.03)
+            reason = f"Contrarian buy (crowd fear)"
+        tp_pct = expected_move_bps / 100.0
+        sl_pct = tp_pct * 0.3
+        return [(sig_type, suggested, max(10.0, tp_pct), max(5.0, sl_pct))]
+
+    def test_fades_extreme_long_crowd(self):
+        from strategies.base_strategy import SignalType
+        result = self._on_positioning(0.7, 0.8, "cascade_imminent", 800.0)
+        assert len(result) == 1
+        sig_type, suggested, tp, sl = result[0]
+        assert sig_type == SignalType.SELL
+        assert suggested == 1.0
+
+    def test_fades_extreme_short_crowd(self):
+        from strategies.base_strategy import SignalType
+        result = self._on_positioning(-0.6, 0.7, "fear", 600.0)
+        assert len(result) == 1
+        sig_type, suggested, tp, sl = result[0]
+        assert sig_type == SignalType.BUY
+        assert suggested <= 0.03
+
+    def test_no_signal_when_neutral(self):
+        result = self._on_positioning(0.2, 0.3, "neutral", 100.0)
+        assert result == []
+
+    def test_tp_sl_asymmetric(self):
+        # Large expected move -> TP big, SL floored at 5% but still < TP
+        result = self._on_positioning(0.6, 0.8, "euphoria", 2000.0)
+        _, _, tp, sl = result[0]
+        assert tp >= 20.0          # ~20% (2000bps)
+        assert sl < tp             # SL always smaller than TP (asymmetric)
+        assert sl >= 5.0           # SL never below the 5% floor

@@ -39,6 +39,7 @@ from strategies.grid_scalping import GridScalpingStrategy
 from strategies.momentum import MomentumStrategy
 from strategies.sniping import SnipingStrategy
 from analysis.alpha_signal import AlphaSignalGenerator
+from analysis.crowd_engine import CrowdPositioningEngine, ContrarianAgent
 from analysis.dev_forensics import DevForensics
 from analysis.lifecycle import LifecycleAnalyzer
 from analysis.liquidity_depth import LiquidityDepthAnalyzer
@@ -142,6 +143,17 @@ class Orchestrator:
         self.peak_hype = PeakHypeDetector(
             order_flow=self.order_flow, sentiment=self.sentiment,
         )
+
+        # Crowd Positioning Engine: fuses order-flow + holder-velocity +
+        # sentiment + bonding-curve into a crowd_score that the ContrarianAgent
+        # fades. Trades the positioning of the crowd, not the price.
+        self.crowd_engine = CrowdPositioningEngine(
+            order_flow=self.order_flow,
+            sentiment=self.sentiment,
+            lifecycle=self.lifecycle,
+            bonding=self.bonding,
+        )
+        self.contrarian = ContrarianAgent()
 
         self._tasks: list[asyncio.Task] = []
         self._stop_event = asyncio.Event()
@@ -263,6 +275,8 @@ class Orchestrator:
         self._tasks.append(asyncio.create_task(self._soft_rug_monitor()))
         # Start the peak-hype contrarian exit monitor (sell into blowoff tops).
         self._tasks.append(asyncio.create_task(self._peak_hype_monitor()))
+        # Start the crowd positioning monitor (fade crowd extremes).
+        self._tasks.append(asyncio.create_task(self._crowd_monitor()))
 
         self.state = "RUNNING"
         log.info("orchestrator.running",
@@ -528,6 +542,41 @@ class Orchestrator:
                                   token=pos.token, error=str(e))
             except Exception as e:
                 log.error("orchestrator.peak_hype_monitor_error", error=str(e))
+            await asyncio.sleep(interval)
+
+    async def _crowd_monitor(self) -> None:
+        """
+        Periodically assess crowd positioning on open positions + recently
+        tracked tokens. If the crowd is at an extreme, the ContrarianAgent
+        emits a fade signal (SELL if crowd is long, BUY if crowd is fearful).
+        Trades the positioning of the crowd, not the price.
+        """
+        interval = 45
+        while not self._stop_event.is_set():
+            try:
+                # Assess both open positions and recently-tracked mints
+                mints: set[str] = set()
+                for pos in self.risk.positions.values():
+                    if pos.chain == "solana":
+                        mints.add(pos.token)
+                mints.update(self.analytics_pipeline._tracked_mints.keys())
+                for mint in mints:
+                    try:
+                        event = await self.crowd_engine.assess(mint)
+                        if abs(event.crowd_score) >= 0.5 and event.conviction >= 0.4:
+                            signals = self.contrarian.on_positioning(event)
+                            for sig in signals:
+                                log.warning("orchestrator.crowd_fade_signal",
+                                            token=mint, crowd_score=event.crowd_score,
+                                            conviction=event.conviction,
+                                            regime=event.regime_hint,
+                                            side=sig.signal_type.value)
+                                await self.signal_queue.put(sig)
+                    except Exception as e:
+                        log.debug("orchestrator.crowd_assess_error",
+                                  token=mint, error=str(e))
+            except Exception as e:
+                log.error("orchestrator.crowd_monitor_error", error=str(e))
             await asyncio.sleep(interval)
 
     # ------------------------------------------------------------------
