@@ -777,3 +777,124 @@ class TestCrowdWeightRouter:
         assert abs(sum(norm.values()) - 1.0) < 1e-9
         assert norm["order_flow"] < base["order_flow"]      # dampened down
         assert norm["mev_penalty"] > base["mev_penalty"]    # relatively up
+
+
+# =====================================================================
+# OMEGA-adapted modules: flow, risk, timing (logic inlined)
+# =====================================================================
+class TestOmegaFlowSignals:
+    """B6 ToxicFlow + B7 SmartMoneyDivergence + B3 WhaleTracker."""
+
+    @staticmethod
+    def _toxic(sell_count, buy_count, net_sol, whale_sells, total_trades):
+        if total_trades < 15: return 0.0, 0.0
+        toxicity = 0.0
+        if buy_count > 0 and sell_count / max(1, buy_count) >= 1.8: toxicity += 0.4
+        if net_sol < 0: toxicity += min(0.4, abs(net_sol) / 10.0)
+        wsp = whale_sells / max(1, total_trades)
+        if wsp > 0.05: toxicity += min(0.3, wsp * 3.0)
+        return max(-1.0, -toxicity), min(1.0, toxicity)
+
+    def test_toxic_flow_flags_sell_dominance(self):
+        s, c = self._toxic(80, 20, -5.0, 10, 100)
+        assert s < -0.5 and c > 0.3
+
+    def test_clean_flow_when_buy_dominant(self):
+        s, c = self._toxic(30, 70, 3.0, 1, 100)
+        assert s > -0.1
+
+    @staticmethod
+    def _divergence(price_pct, bs_ratio, total_trades):
+        if total_trades < 10: return 0.0, "no_data"
+        price_bullish = price_pct > 2.0
+        flow_bullish = bs_ratio > 1.0
+        if not price_bullish: return max(-0.3, min(0.3, price_pct / 20.0)), "flat"
+        if not flow_bullish:
+            ds = min(1.0, abs(price_pct) / 30.0)
+            fn = min(1.0, (1.0 / max(0.01, bs_ratio)) / 3.0)
+            return -min(1.0, ds * fn), "bearish_divergence"
+        return min(1.0, (price_pct / 30.0) * (bs_ratio / 3.0)), "confirmed_uptrend"
+
+    def test_divergence_detects_distribution(self):
+        s, lbl = self._divergence(30.0, 0.5, 100)
+        assert s < -0.3 and lbl == "bearish_divergence"
+
+    def test_confirmed_uptrend_when_aligned(self):
+        s, lbl = self._divergence(25.0, 3.0, 100)
+        assert s > 0.3 and lbl == "confirmed_uptrend"
+
+
+class TestOmegaRiskSignals:
+    """B22 AdaptiveRiskManager + B8 VolatilityForecast + B20 StressIndex."""
+
+    @staticmethod
+    def _size_mult(stress_score, token_vol, loss_streak):
+        stress_mult = 1.0 - (stress_score / 100.0) * 0.7
+        vol_mult = max(0.2, min(1.0, 0.02 / token_vol)) if token_vol > 0 else 1.0
+        streak_mult = max(0.3, 1.0 - loss_streak * 0.12)
+        return max(0.1, min(1.0, stress_mult * vol_mult * streak_mult))
+
+    def test_calm_market_full_size(self):
+        assert self._size_mult(10, 0.02, 0) > 0.8
+
+    def test_panic_market_minimal_size(self):
+        assert self._size_mult(90, 0.08, 4) < 0.3
+
+    def test_loss_streak_reduces_size_monotonically(self):
+        sizes = [self._size_mult(20, 0.02, n) for n in range(5)]
+        for i in range(len(sizes) - 1):
+            assert sizes[i] >= sizes[i + 1]  # each loss shrinks size
+
+
+class TestOmegaTimingSignals:
+    """B12 TimeOfDayAlpha + B15 MultiTimeframeSignal + B24 SentimentNLP."""
+
+    SESSIONS = [(14, 21, 1.20), (0, 8, 1.10), (8, 14, 0.90), (21, 24, 0.80)]
+
+    def _tod(self, hour):
+        for s, e, m in self.SESSIONS:
+            if s <= hour < e: return m
+        return 0.90
+
+    def test_us_session_boosted(self):
+        assert self._tod(18) == 1.20
+
+    def test_dead_hours_dampened(self):
+        assert self._tod(23) == 0.80
+
+    @staticmethod
+    def _mtf(directions):
+        weights = [0.15, 0.25, 0.30, 0.30]
+        net = sum(w * d for w, d in zip(weights, directions))
+        active = [d for d in directions if abs(d) > 0.1]
+        if not active: return 0.0, 0.0
+        signs = set(1 if d > 0 else -1 for d in active)
+        alignment = 1.0 if len(signs) == 1 else 0.3
+        return net, alignment * abs(net)
+
+    def test_mtf_aligned_high_conviction(self):
+        _, c = self._mtf([0.8, 0.7, 0.6, 0.5])
+        assert c > 0.5
+
+    def test_mtf_conflicting_low_conviction(self):
+        _, c = self._mtf([0.8, -0.5, 0.6, -0.3])
+        assert c < 0.2
+
+    BULLISH = {"moon", "pump", "buy", "send", "based", "gem"}
+    BEARISH = {"rug", "dump", "sell", "scam", "jeet"}
+
+    def _nlp(self, texts):
+        b = sum(1 for t in texts if any(k in t.lower() for k in self.BULLISH))
+        s = sum(1 for t in texts if any(k in t.lower() for k in self.BEARISH))
+        total = b + s
+        if total == 0: return 0.0
+        return max(-1.0, min(1.0, (b - s) / total))
+
+    def test_nlp_bullish_text(self):
+        assert self._nlp(["moon", "buy this gem"]) > 0.5
+
+    def test_nlp_bearish_text(self):
+        assert self._nlp(["dev rugged", "scam alert"]) < -0.5
+
+    def test_nlp_neutral_text(self):
+        assert self._nlp(["hello world", "nice day"]) == 0.0

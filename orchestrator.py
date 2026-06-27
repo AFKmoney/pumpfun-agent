@@ -42,15 +42,20 @@ from analysis.alpha_signal import AlphaSignalGenerator
 from analysis.crowd_engine import CrowdPositioningEngine, ContrarianAgent
 from analysis.crowd_weight_router import CrowdWeightRouter
 from analysis.dev_forensics import DevForensics
+from analysis.flow_signals import ToxicFlowDetector, SmartMoneyDivergence, WhaleTracker
 from analysis.lifecycle import LifecycleAnalyzer
 from analysis.liquidity_depth import LiquidityDepthAnalyzer
+from analysis.macro_signals import MacroEngine
 from analysis.mev_detector import MevDetector
+from analysis.microstructure_signals import FlashCrashScanner, MempoolMonitor, BridgeTracker
 from analysis.order_flow import OrderFlowAnalyzer
 from analysis.peak_hype import PeakHypeDetector
 from analysis.regime import RegimeDetector
+from analysis.risk_signals import AdaptiveRiskManager, StressIndex, VolatilityForecast
 from analysis.sentiment import SentimentAnalyzer
 from analysis.social_graph import SocialGraphAnalyzer
 from analysis.soft_rug import SoftRugDetector
+from analysis.timing_signals import TimeOfDayAlpha, MultiTimeframeSignal, SentimentNLP
 from utils.analytics_pipeline import AnalyticsPipeline
 from utils.anti_sandwich import AntiSandwich
 from utils.attribution import AutoTuner
@@ -159,6 +164,26 @@ class Orchestrator:
             bonding=self.bonding,
         )
         self.contrarian = ContrarianAgent()
+
+        # --- OMEGA-adapted signal modules (17 techniques) ---
+        # Batch A: flow & divergence (the highest-PnL transfers)
+        self.toxic_flow = ToxicFlowDetector(self.order_flow)
+        self.smart_money_div = SmartMoneyDivergence(self.order_flow)
+        self.whale_tracker_sig = WhaleTracker(self.order_flow)
+        # Batch B: adaptive risk
+        self.vol_forecast = VolatilityForecast()
+        self.stress_index = StressIndex(self.vol_forecast)
+        self.adaptive_risk = AdaptiveRiskManager(self.stress_index, self.vol_forecast)
+        # Batch C: macro/régime
+        self.macro_engine = MacroEngine()
+        # Batch D: microstructure
+        self.flash_crash = FlashCrashScanner(self.bonding)
+        self.mempool_monitor = MempoolMonitor()
+        self.bridge_tracker = BridgeTracker()
+        # Batch E: timing & signal quality
+        self.time_of_day = TimeOfDayAlpha()
+        self.mtf_signal = MultiTimeframeSignal(self.order_flow)
+        self.sentiment_nlp = SentimentNLP(self.sentiment)
 
         self._tasks: list[asyncio.Task] = []
         self._stop_event = asyncio.Event()
@@ -282,6 +307,8 @@ class Orchestrator:
         self._tasks.append(asyncio.create_task(self._peak_hype_monitor()))
         # Start the crowd positioning monitor (fade crowd extremes).
         self._tasks.append(asyncio.create_task(self._crowd_monitor()))
+        # Start the OMEGA-adapted signals monitor (flow anomalies + macro + risk).
+        self._tasks.append(asyncio.create_task(self._omega_monitor()))
 
         self.state = "RUNNING"
         log.info("orchestrator.running",
@@ -588,6 +615,80 @@ class Orchestrator:
             except Exception as e:
                 log.error("orchestrator.crowd_monitor_error", error=str(e))
             await asyncio.sleep(interval)
+
+    async def _omega_monitor(self) -> None:
+        """
+        Periodic monitor for the OMEGA-adapted signal modules:
+        - Updates volatility forecast from live prices.
+        - Polls macro engine (BTC/SOL/dom/stablecoin/depeg).
+        - Checks for toxic flow + smart-money divergence + flash-crash depth
+          anomalies on open positions; alerts + feeds the crowd engine.
+        - Updates the AdaptiveRiskManager with trade outcomes.
+        """
+        macro_interval = 300  # 5 min
+        flow_interval = 30    # 30s
+        last_macro = 0.0
+        while not self._stop_event.is_set():
+            now = time.time()
+            try:
+                # --- Flow + microstructure checks on open positions (every cycle) ---
+                for key, pos in list(self.risk.positions.items()):
+                    if pos.chain != "solana":
+                        continue
+                    try:
+                        price = await self.adapters["solana"].get_price(pos.token)
+                        if price <= 0:
+                            continue
+                        # Update vol forecast
+                        self.vol_forecast.update(pos.token, price)
+
+                        # Toxic flow: if strongly toxic, alert (precursor to dump)
+                        toxic = self.toxic_flow.detect(pos.token)
+                        if toxic.conviction > 0.5:
+                            log.warning("omega.toxic_flow_detected",
+                                        token=pos.token, label=toxic.label,
+                                        conviction=toxic.conviction)
+
+                        # Smart-money divergence: price up but flow negative = distribution
+                        # (need price 5m ago; approximate from entry if recent)
+                        div = self.smart_money_div.assess(
+                            pos.token, price, pos.entry_price
+                        )
+                        if div.label == "bearish_divergence" and div.conviction > 0.4:
+                            log.warning("omega.smart_money_divergence",
+                                        token=pos.token, score=div.score,
+                                        detail=div.detail)
+                            await self.notifier.notify_error(
+                                f"📉 SMART MONEY EXITING\nToken: {pos.token}\n"
+                                f"Price up but net flow negative (distribution)"
+                            )
+
+                        # Flash crash depth scan
+                        fc = await self.flash_crash.scan(pos.token)
+                        if fc.is_anomalous:
+                            log.warning("omega.flash_crash_anomaly",
+                                        token=pos.token, drop=fc.depth_drop_pct,
+                                        reason=fc.reason)
+                    except Exception as e:
+                        log.debug("omega.position_check_error",
+                                  token=pos.token, error=str(e))
+
+                # --- Macro engine poll (every 5 min) ---
+                if now - last_macro > macro_interval:
+                    try:
+                        macro = await self.macro_engine.assess()
+                        if macro.label == "risk_off" or "depeg" in macro.components.get("depeg", {}):
+                            if macro.components.get("depeg", {}).get("depegged"):
+                                await self.notifier.notify_error(
+                                    f"🚨 DEPEG ALERT — risk-off\n{macro.components['depeg']}"
+                                )
+                        last_macro = now
+                    except Exception as e:
+                        log.warning("omega.macro_failed", error=str(e))
+
+            except Exception as e:
+                log.error("omega.monitor_error", error=str(e))
+            await asyncio.sleep(flow_interval)
 
     # ------------------------------------------------------------------
     async def _shutdown(self) -> None:
