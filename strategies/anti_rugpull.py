@@ -168,7 +168,7 @@ class AntiRugpullStrategy(BaseStrategy):
                 pass
 
             # Skip micro-buy in paper mode (would do nothing anyway)
-            mode = self.cfg.get_nested("trading", "mode", default="paper")
+            mode = Config.get().get_nested("trading", "mode", default="paper")
             if mode != "live":
                 return False, "OK (paper mode, freeze check passed)"
 
