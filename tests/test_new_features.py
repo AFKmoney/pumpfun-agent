@@ -898,3 +898,110 @@ class TestOmegaTimingSignals:
 
     def test_nlp_neutral_text(self):
         assert self._nlp(["hello world", "nice day"]) == 0.0
+
+
+# =====================================================================
+# Multi-wallet sharding + atomic bundle
+# =====================================================================
+class TestWalletSharding:
+    """Shard derivation + acquire/release (inlined, no Config)."""
+
+    @staticmethod
+    def _derive(seed_bytes_64, count):
+        from solders.keypair import Keypair
+        shards = []
+        for i in range(count):
+            path = f"m/44'/501'/{i}'/0'"
+            try:
+                kp = Keypair.from_seed_and_derivation_path(seed_bytes_64, path)
+            except Exception:
+                kp = Keypair.from_seed(seed_bytes_64[:28] + i.to_bytes(4, "little"))
+            shards.append((i, str(kp.pubkey())))
+        return shards
+
+    def test_shards_are_unique(self):
+        import hashlib
+        seed = (hashlib.sha256(b"test").digest()) * 2
+        shards = self._derive(seed, 5)
+        pubkeys = [pk for _, pk in shards]
+        assert len(set(pubkeys)) == 5
+
+    def test_shards_are_deterministic(self):
+        import hashlib
+        seed = (hashlib.sha256(b"test").digest()) * 2
+        s1 = self._derive(seed, 3)
+        s2 = self._derive(seed, 3)
+        assert [pk for _, pk in s1] == [pk for _, pk in s2]
+
+    def test_acquire_release_round_robin(self):
+        import time
+
+        class S:
+            def __init__(self, i):
+                self.index = i; self.busy = False; self.last_used_ts = 0.0
+
+        shards = [S(i) for i in range(3)]
+
+        def acquire():
+            free = [s for s in shards if not s.busy]
+            if not free: return None
+            s = min(free, key=lambda x: x.last_used_ts)
+            s.busy = True; s.last_used_ts = time.time()
+            return s
+
+        a = acquire(); b = acquire(); c = acquire()
+        assert a.index == 0 and b.index == 1 and c.index == 2
+        assert acquire() is None  # all busy
+        a.busy = False
+        d = acquire()
+        assert d.index == 0  # LRU reuse
+
+
+class TestAtomicBundle:
+    """Atomic sniper+exit bundle construction."""
+
+    def test_builds_two_valid_versioned_transactions(self):
+        from solders.keypair import Keypair
+        from solders.message import MessageV0
+        from solders.hash import Hash
+        from solders.transaction import VersionedTransaction
+        from solders.compute_budget import set_compute_unit_limit, set_compute_unit_price
+        from utils import pumpfun_ix
+        import base64
+
+        buyer = Keypair()
+        mint = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+        bh = Hash.default()
+        cu_l = set_compute_unit_limit(200_000)
+        cu_p = set_compute_unit_price(5_000)
+
+        buy_ix = pumpfun_ix.build_buy_ix(str(buyer.pubkey()), mint, 1_000_000, 50_000_000)
+        ata_ix = pumpfun_ix.build_create_ata_ix(str(buyer.pubkey()), mint)
+        sell_ix = pumpfun_ix.build_sell_ix(str(buyer.pubkey()), mint, 500_000)
+
+        # Tx 1: buy (with ATA creation)
+        msg1 = MessageV0.try_compile(
+            payer=buyer.pubkey(),
+            instructions=[cu_l, cu_p, ata_ix, buy_ix],
+            address_lookup_table_accounts=[], recent_blockhash=bh,
+        )
+        tx1 = VersionedTransaction(msg1, [buyer])
+
+        # Tx 2: sell (fraction of bought)
+        msg2 = MessageV0.try_compile(
+            payer=buyer.pubkey(),
+            instructions=[cu_l, cu_p, sell_ix],
+            address_lookup_table_accounts=[], recent_blockhash=bh,
+        )
+        tx2 = VersionedTransaction(msg2, [buyer])
+
+        bundle = [
+            base64.b64encode(bytes(tx1)).decode("ascii"),
+            base64.b64encode(bytes(tx2)).decode("ascii"),
+        ]
+        assert len(bundle) == 2
+        assert len(bundle[0]) > 100  # non-trivial tx
+        assert len(bundle[1]) > 100
+        # Both must be decodable back
+        assert VersionedTransaction.from_bytes(base64.b64decode(bundle[0])) is not None
+        assert VersionedTransaction.from_bytes(base64.b64decode(bundle[1])) is not None
