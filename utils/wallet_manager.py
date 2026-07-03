@@ -2,9 +2,20 @@
 wallet_manager.py
 =================
 Non-custodial wallet manager.
-- Generates / loads Solana + EVM wallets.
+- Generates / loads Solana + EVM wallets from MULTIPLE input formats.
 - NEVER exposes private keys to the network or to other modules.
 - All signing is performed locally.
+
+Supported Solana wallet connection methods (in priority order):
+  1. SOLANA_PRIVATE_KEY — a raw base58 private key (what Phantom exports as
+     "Private Key" in Account settings). This is the MOST common way users
+     connect their pump.fun wallet.
+  2. SOLANA_KEYPAIR_JSON — a JSON array of 64 numbers (Solana CLI keypair
+     format, also exportable from Phantom as "Export Private Key JSON").
+  3. SOLANA_WALLET_SEED — a 12/24 word mnemonic seed phrase (BIP39).
+  4. None of the above — generates an ephemeral keypair (no funds, for testing).
+
+The bot checks env vars in that order and uses the first one it finds.
 """
 from __future__ import annotations
 
@@ -32,7 +43,7 @@ class WalletManager:
         self._init_evm()
 
     # ------------------------------------------------------------------
-    # Solana
+    # Solana — multi-format key loading
     # ------------------------------------------------------------------
     def _init_solana(self) -> None:
         if "solana" not in self.cfg["chains"]:
@@ -41,19 +52,50 @@ class WalletManager:
             from solders.keypair import Keypair
             seed_env = self.cfg["chains"]["solana"]["dedicated_wallet_seed_env"]
             seed_phrase = self.cfg.env(seed_env, required=False)
-            if not seed_phrase:
-                log.warning("solana.wallet.seed_missing", msg="No Solana seed in env; generating ephemeral keypair (no funds).")
-                self.solana_keypair = Keypair()
+
+            # Method 1: SOLANA_PRIVATE_KEY (base58 private key — most common for
+            # Phantom/pump.fun wallet users)
+            priv_key = self.cfg.env("SOLANA_PRIVATE_KEY", required=False)
+            if priv_key and priv_key.strip():
+                try:
+                    import base58
+                    raw = base58.b58decode(priv_key.strip())
+                    if len(raw) == 64:
+                        self.solana_keypair = Keypair.from_bytes(raw)
+                        log.info("solana.wallet.loaded_via_private_key",
+                                 pubkey=str(self.solana_keypair.pubkey()))
+                        return
+                except Exception as e:
+                    log.warning("solana.wallet.private_key_parse_failed", error=str(e))
+
+            # Method 2: SOLANA_KEYPAIR_JSON (JSON array of 64 numbers)
+            keypair_json = self.cfg.env("SOLANA_KEYPAIR_JSON", required=False)
+            if keypair_json and keypair_json.strip():
+                try:
+                    arr = json.loads(keypair_json)
+                    if isinstance(arr, list) and len(arr) == 64:
+                        self.solana_keypair = Keypair.from_bytes(bytes(arr))
+                        log.info("solana.wallet.loaded_via_keypair_json",
+                                 pubkey=str(self.solana_keypair.pubkey()))
+                        return
+                except Exception as e:
+                    log.warning("solana.wallet.keypair_json_parse_failed", error=str(e))
+
+            # Method 3: SOLANA_WALLET_SEED (mnemonic phrase)
+            if seed_phrase:
+                import mnemonic
+                m = mnemonic.Mnemonic("english")
+                seed = m.to_seed(seed_phrase)
+                self.solana_keypair = Keypair.from_seed_and_derivation_path(
+                    seed, "m/44'/501'/0'/0'"
+                ) if hasattr(Keypair, "from_seed_and_derivation_path") else Keypair.from_seed(seed[:32])
+                log.info("solana.wallet.loaded_via_seed_phrase",
+                         pubkey=str(self.solana_keypair.pubkey()))
                 return
-            # Convert mnemonic -> seed -> keypair
-            # NOTE: For production use a hardware wallet or remote signer.
-            import mnemonic
-            m = mnemonic.Mnemonic("english")
-            seed = m.to_seed(seed_phrase)
-            self.solana_keypair = Keypair.from_seed_and_derivation_path(
-                seed, "m/44'/501'/0'/0'"
-            ) if hasattr(Keypair, "from_seed_and_derivation_path") else Keypair.from_seed(seed[:32])
-            log.info("solana.wallet.loaded", pubkey=str(self.solana_keypair.pubkey()))
+
+            # No credentials — ephemeral
+            log.warning("solana.wallet.seed_missing", msg="No Solana wallet credentials in env; generating ephemeral keypair (no funds).")
+            self.solana_keypair = Keypair()
         except Exception as e:
             log.error("solana.wallet.init_failed", error=str(e))
             raise
