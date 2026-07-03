@@ -40,6 +40,7 @@ from analysis.flow_signals import ToxicFlowDetector, SmartMoneyDivergence, Whale
 from analysis.regime import RegimeDetector
 from analysis.soft_rug import SoftRugDetector, RugFeatures, RugPrediction
 from analysis.timing_signals import MultiTimeframeSignal, SentimentNLP, TimeOfDayAlpha
+from typing import Optional
 from utils.logger import setup_logger
 
 log = setup_logger("entry_edge")
@@ -60,6 +61,8 @@ class EntryAssessment:
 class EntryEdgeScorer:
     """
     Fuses all signals into a single entry-quality gate.
+    Includes the OMEGA2 trend filter: only enter WITH the 50-bar trend,
+    never against it (the single biggest win-rate driver in OMEGA2's backtest).
     """
 
     def __init__(
@@ -71,6 +74,7 @@ class EntryEdgeScorer:
         mtf: MultiTimeframeSignal,
         sentiment_nlp: SentimentNLP,
         time_of_day: TimeOfDayAlpha,
+        atr_tracker: Optional[object] = None,
     ) -> None:
         self.toxic_flow = toxic_flow
         self.smart_money = smart_money
@@ -79,6 +83,9 @@ class EntryEdgeScorer:
         self.mtf = mtf
         self.sentiment_nlp = sentiment_nlp
         self.time_of_day = time_of_day
+        self.atr_tracker = atr_tracker  # for ATR-dynamic TP/SL
+        # Per-token price history for the trend filter (OMEGA2: 50-bar trend)
+        self._price_history: dict[str, list[float]] = {}
 
     def assess(self, token: str, price_now: float, price_5m_ago: float) -> EntryAssessment:
         """
@@ -136,6 +143,36 @@ class EntryEdgeScorer:
             boosts["peak_session"] = int((tod_mult - 1.0) * 20)  # +4 for US session
         elif tod_mult < 0.9:
             boosts["dead_hours"] = -3
+
+        # 9. OMEGA2 TREND FILTER — the single biggest win-rate driver.
+        # Only enter WITH the 50-bar trend, never against it. On pump.fun
+        # "bars" = price observations; we track the rolling series.
+        self._price_history.setdefault(token, []).append(price_now)
+        self._price_history[token] = self._price_history[token][-50:]
+        hist = self._price_history[token]
+        if len(hist) >= 20:
+            # 50-bar (or available) trend direction
+            trend_start = hist[len(hist) // 2]  # midpoint price
+            trend_pct = (price_now - trend_start) / trend_start * 100 if trend_start > 0 else 0
+            short_term_pct = (price_now - price_5m_ago) / price_5m_ago * 100 if price_5m_ago > 0 else 0
+            # Trading WITH the trend = both same sign and non-trivial
+            if abs(trend_pct) > 2.0 and (trend_pct > 0) == (short_term_pct > 0):
+                boosts["with_trend"] = 12  # OMEGA2: +12 for trend-aligned entries
+            elif abs(trend_pct) > 2.0 and (trend_pct > 0) != (short_term_pct > 0):
+                vetoes.append("against_trend")  # VETO: never fight the trend
+
+        # 10. ATR-dynamic TP/SL (OMEGA2's volatility-adaptive exits)
+        # If we have an ATR tracker, compute dynamic SL/TP for this token
+        atr_sl = None
+        atr_tp = None
+        if self.atr_tracker is not None:
+            self.atr_tracker.update(price_now)
+            atr_sl = self.atr_tracker.dynamic_sl_bps()
+            atr_tp = self.atr_tracker.dynamic_tp_bps()
+            # High ATR (volatile) = riskier = need stronger confluence
+            atr = self.atr_tracker.atr_bps()
+            if atr and atr > 200:  # >2% per bar = extreme vol
+                boosts["high_vol_caution"] = -8
 
         # === COMPUTE FINAL SCORE ===
         score = 50 + sum(boosts.values())

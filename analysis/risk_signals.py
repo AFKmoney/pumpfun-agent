@@ -1,26 +1,31 @@
 """
 risk_signals.py
 ===============
-Batch B — Adaptive risk management adapted from OMEGA.
+Adaptive risk management — VolatilityForecast + StressIndex + AdaptiveRiskManager
+(with Monte Carlo de-risking ported from OMEGA2).
 
 1. VolatilityForecast (B8):
-   GARCH(1,1)-style / EWMA volatility forecast per token. Predicts the vol
-   regime to adjust position sizing (high vol = smaller size).
+   EWMA volatility forecast per token (RiskMetrics lambda=0.94).
 
 2. StressIndex (B20):
-   Composite 0-100 "VIX of crypto" from BTC vol + SOL vol + market breadth.
-   Feeds the AdaptiveRiskManager to throttle sizing in stressed markets.
+   Composite 0-100 from BTC vol + SOL vol + market breadth.
 
-3. AdaptiveRiskManager (B22):
-   Dynamic Kelly fraction that responds to: stress index, per-token vol,
-   and loss streak. When stressed or in a losing streak, size down. When
-   winning and calm, size up. Replaces the static fixed-size with a
-   self-regulating one.
+3. ATRTracker (ported from OMEGA2 risk.py):
+   Rolling Average True Range in bps. Used for ATR-dynamic TP/SL — scale
+   stops/targets with realized volatility instead of fixed percentages.
+   OMEGA2's best backtested idea: SL = 1.5×ATR, TP = 2.5×SL.
+
+4. AdaptiveRiskManager (B22 + OMEGA2 MC):
+   Dynamic Kelly fraction × stress × vol × loss-streak × Monte Carlo
+   drawdown probability. The MC layer (ported from OMEGA2 risk.py:357)
+   simulates 2000 bootstrap paths from our trade history and shrinks size
+   when drawdown probability exceeds 30%.
 """
 from __future__ import annotations
 
 import math
 import time
+from collections import deque
 from dataclasses import dataclass
 from typing import Optional
 
@@ -80,6 +85,60 @@ class VolatilityForecast:
         for r in rets[1:]:
             var = self.LAMBDA * var + (1 - self.LAMBDA) * r ** 2
         return math.sqrt(var)
+
+
+# =====================================================================
+# ATRTracker (ported from OMEGA2 risk.py) — ATR-dynamic TP/SL
+# =====================================================================
+class ATRTracker:
+    """
+    Rolling Average True Range in basis points. OMEGA2's key insight: scale
+    stop-loss and take-profit with realized volatility, not fixed %.
+
+    ATR-dynamic TP/SL (the OMEGA2 winning parameter set):
+      SL = max(60 bps, 1.5 × ATR_bps)     # tighter in calm markets
+      TP = 2.5 × SL                        # 2.5:1 R/R minimum
+
+    On pump.fun, "True Range" per bar = |price_now - price_prev| (we don't
+    have separate H/L on a bonding curve, so we approximate with close-to-close).
+    """
+    def __init__(self, period: int = 14) -> None:
+        self.period = period
+        self._closes: deque = deque(maxlen=period + 1)
+
+    def update(self, price: float) -> None:
+        if price > 0:
+            self._closes.append(price)
+
+    def atr_bps(self) -> Optional[float]:
+        """
+        Return the ATR in basis points. None if insufficient data.
+        Approximates TR as |close[i] - close[i-1]| (no intrabar H/L available).
+        """
+        if len(self._closes) < self.period + 1:
+            return None
+        closes = list(self._closes)
+        # True Range = |close[i] - close[i-1]| (bonding curve approximation)
+        trs = []
+        for i in range(1, len(closes)):
+            if closes[i - 1] > 0:
+                trs.append(abs(closes[i] - closes[i - 1]) / closes[i - 1] * 10_000)
+        if not trs:
+            return None
+        atr = sum(trs[-self.period:]) / min(self.period, len(trs))
+        # Clamp to a sane range (OMEGA2 used 30-300 bps)
+        return max(10.0, min(500.0, atr))
+
+    def dynamic_sl_bps(self) -> float:
+        """ATR-dynamic stop-loss: 1.5×ATR, floored at 60 bps."""
+        atr = self.atr_bps()
+        if atr is None:
+            return 150.0  # default 1.5% if no data
+        return max(60.0, 1.5 * atr)
+
+    def dynamic_tp_bps(self) -> float:
+        """ATR-dynamic take-profit: 2.5× the stop-loss."""
+        return 2.5 * self.dynamic_sl_bps()
 
 
 # =====================================================================
@@ -187,18 +246,69 @@ class AdaptiveRiskManager:
         self.vol_forecast = vol_forecast
         self._loss_streak = 0
         self._max_streak = 5
+        # Monte Carlo de-risking pool (ported from OMEGA2 risk.py)
+        # Stores per-trade returns for bootstrap simulation.
+        self._mc_returns: deque = deque(maxlen=500)
+        self._mc_multiplier: float = 1.0
 
-    def record_trade_outcome(self, won: bool) -> None:
-        """Feed the loss-streak tracker. Call on every closed trade."""
+    def record_trade_outcome(self, won: bool, pnl_pct: float = 0.0) -> None:
+        """Feed the loss-streak tracker + MC pool. Call on every closed trade."""
         if won:
             self._loss_streak = 0
         else:
             self._loss_streak = min(self._max_streak, self._loss_streak + 1)
+        # Feed the MC pool for drawdown-probability estimation
+        if pnl_pct != 0.0:
+            self._mc_returns.append(pnl_pct / 100.0)
+            self._recompute_mc_multiplier()
+
+    def _recompute_mc_multiplier(self) -> None:
+        """
+        Monte Carlo de-risking (ported from OMEGA2 risk.py:357).
+        Simulates 2000 bootstrap paths over a 20-trade horizon from our
+        historical returns. If >30% of paths hit a 10% drawdown, we shrink
+        the position size proportionally. This is drawdown-aware adaptive
+        sizing — the more our recent history shows drawdown risk, the smaller
+        we trade.
+        """
+        if len(self._mc_returns) < 30:
+            self._mc_multiplier = 1.0
+            return
+        import numpy as np
+        returns = np.array(list(self._mc_returns))
+        # Outlier filter: drop |r| >= 5×std (prevents fat-tail domination)
+        std = returns.std()
+        if std > 0:
+            returns = returns[np.abs(returns) < 5 * std]
+        if len(returns) < 20:
+            self._mc_multiplier = 1.0
+            return
+        # Bootstrap: 2000 paths × 20 trades
+        n_paths = 2000
+        horizon = 20
+        rng = np.random.default_rng()
+        sampled = rng.choice(returns, size=(n_paths, horizon), replace=True)
+        # Cumulative equity curves
+        equity = np.cumprod(1 + sampled, axis=1)
+        # Max drawdown per path
+        peak = np.maximum.accumulate(equity, axis=1)
+        drawdown = (equity - peak) / peak
+        max_dd = np.min(drawdown, axis=1)  # most negative per path
+        # Probability of a 10%+ drawdown
+        prob_dd = np.mean(max_dd <= -0.10)
+        # Map probability to multiplier: <0.3 → 1.0, >0.8 → 0.2, linear
+        if prob_dd < 0.3:
+            self._mc_multiplier = 1.0
+        elif prob_dd > 0.8:
+            self._mc_multiplier = 0.2
+        else:
+            self._mc_multiplier = 1.0 - (prob_dd - 0.3) / 0.5 * 0.8
 
     def size_multiplier(self, token: Optional[str] = None) -> float:
         """
         Return a multiplier 0..1 to apply to the base position size.
-        Combines stress, volatility, and loss-streak dampening.
+        Combines stress, volatility, loss-streak, and Monte Carlo drawdown
+        probability dampening.
         """
         stress = self.stress.compute()
         # Stress dampening: calm(0) -> 1.0, panic(100) -> 0.3
@@ -209,10 +319,12 @@ class AdaptiveRiskManager:
         if token:
             fvol = self.vol_forecast.forecast_vol(token)
             if fvol and fvol > 0:
-                # 2% per-bar vol = full size; 10% = 20% of size
                 vol_mult = max(0.2, min(1.0, 0.02 / fvol))
 
-        # Loss streak dampening: each consecutive loss -> -12% size
+        # Loss streak dampening
         streak_mult = max(0.3, 1.0 - self._loss_streak * 0.12)
 
-        return max(0.1, min(1.0, stress_mult * vol_mult * streak_mult))
+        # Monte Carlo drawdown-probability dampening (ported from OMEGA2)
+        mc_mult = self._mc_multiplier
+
+        return max(0.1, min(1.0, stress_mult * vol_mult * streak_mult * mc_mult))

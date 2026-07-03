@@ -138,16 +138,20 @@ class CrowdPositioningEngine:
         # Conviction: high when signals agree on direction AND magnitude.
         # Divergence penalty: if some signals are +0.8 and others -0.3, that's
         # a weak setup even if the weighted average is high.
+        # Ported from OMEGA2: count individual dissenting signals (not just
+        # binary agree/disagree). This is a finer-grained conviction measure.
         active = [v for v in scores.values() if abs(v) > 0.15]
         if not active:
             conviction = 0.0
         else:
-            # Mean direction strength
             mean_abs = sum(abs(v) for v in active) / len(active)
-            # Agreement: are all active signals the same sign?
-            signs = set(1 if v > 0 else -1 for v in active)
-            agreement = 1.0 if len(signs) == 1 else (0.4 if len(active) <= 2 else 0.2)
-            conviction = min(1.0, mean_abs * agreement)
+            # OMEGA2-style: count how many significant signals DISAGREE with
+            # the net crowd_score direction. Each dissenter reduces conviction.
+            direction = 1 if crowd_score >= 0 else -1
+            disagree = sum(1 for v in active if (1 if v > 0 else -1) != direction)
+            divergence = disagree / len(active) if active else 1.0
+            # conviction = magnitude × (1 − fraction of dissenters)
+            conviction = min(1.0, mean_abs * (1.0 - divergence))
 
         # Horizon: a cascade (all signals screaming) is acute (minutes);
         # mild euphoria is longer (hours).
@@ -165,8 +169,9 @@ class CrowdPositioningEngine:
             regime_hint = "neutral"
 
         # Expected move: heuristic. Crowds at extreme positioning reverse hard.
-        # Base ~200bps for a moderate extreme, scaling up for high conviction.
-        expected_move_bps = abs(crowd_score) * conviction * 1500.0
+        # Ported from OMEGA2: scale by horizon (minutes < hours < days).
+        base = {"minutes": 500.0, "hours": 1500.0, "days": 3000.0}[horizon]
+        expected_move_bps = abs(crowd_score) * conviction * base
 
         return CrowdPositioningEvent(
             token=token,
